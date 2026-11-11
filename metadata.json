@@ -1,0 +1,8 @@
+{
+  "uuid": "lyrics-island@b-log",
+  "name": "Lyrics Island",
+  "description": "Dynamic Island-style synced lyrics for YouTube Music (Pear Desktop) and other MPRIS players.",
+  "shell-version": ["45", "46", "47"],
+  "settings-schema": "org.gnome.shell.extensions.lyrics-island",
+  "version": 1
+}

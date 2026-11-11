@@ -1,0 +1,132 @@
+.lyrics-island {
+  background-color: #000;
+  border-radius: 14px;
+  color: #fff;
+}
+
+.lyrics-island.expanded {
+  border-radius: 28px;
+}
+
+.li-compact {
+  padding: 0 12px 0 4px;
+  spacing: 8px;
+}
+
+.li-art-small,
+.li-art-large {
+  background-color: #262626;
+  background-size: cover;
+}
+
+.li-art-small { border-radius: 7px; }
+.li-art-large { border-radius: 12px; }
+
+.li-line {
+  color: #fff;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.li-expanded {
+  padding: 16px 20px 14px;
+  spacing: 12px;
+}
+
+.li-header { spacing: 12px; }
+
+.li-title {
+  font-size: 11pt;
+  font-weight: 700;
+}
+
+.li-artist {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 10pt;
+}
+
+.li-lyrics { spacing: 4px; }
+
+.li-prev,
+.li-next {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 10pt;
+  min-height: 16px;
+}
+
+.li-current {
+  font-size: 13pt;
+  font-weight: 700;
+  min-height: 44px;
+}
+
+.li-progress { spacing: 10px; }
+
+.li-time {
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 8.5pt;
+}
+
+.li-credit {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 8pt;
+}
+
+.li-track {
+  height: 4px;
+  border-radius: 2px;
+  background-color: rgba(255, 255, 255, 0.18);
+}
+
+.li-fill {
+  height: 4px;
+  border-radius: 2px;
+  background-color: #fff;
+}
+
+.li-controls { spacing: 28px; }
+
+.li-control {
+  padding: 6px;
+  border-radius: 99px;
+  color: #fff;
+}
+
+.li-control:hover { background-color: rgba(255, 255, 255, 0.14); }
+.li-control:active { background-color: rgba(255, 255, 255, 0.24); }
+
+.li-bars { spacing: 2px; }
+
+.li-bar {
+  width: 3px;
+  border-radius: 2px;
+  background-color: #fff;
+}
+
+/* Light theme: same layout, inverted colors. */
+.lyrics-island.light {
+  background-color: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  color: #000;
+}
+
+.lyrics-island.light .li-art-small,
+.lyrics-island.light .li-art-large { background-color: #e0e0e0; }
+
+.lyrics-island.light .li-line,
+.lyrics-island.light .li-control { color: #000; }
+
+.lyrics-island.light .li-artist { color: rgba(0, 0, 0, 0.6); }
+
+.lyrics-island.light .li-prev,
+.lyrics-island.light .li-next,
+.lyrics-island.light .li-credit { color: rgba(0, 0, 0, 0.45); }
+
+.lyrics-island.light .li-time { color: rgba(0, 0, 0, 0.55); }
+.lyrics-island.light .li-track { background-color: rgba(0, 0, 0, 0.15); }
+
+.lyrics-island.light .li-fill,
+.lyrics-island.light .li-bar { background-color: #000; }
+
+.lyrics-island.light .li-control:hover { background-color: rgba(0, 0, 0, 0.1); }
+.lyrics-island.light .li-control:active { background-color: rgba(0, 0, 0, 0.18); }

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.lyrics-island" path="/org/gnome/shell/extensions/lyrics-island/">
+    <key name="lyric-offset" type="i">
+      <range min="-5000" max="5000"/>
+      <default>0</default>
+      <summary>Lyric offset (ms)</summary>
+      <description>Added to the playback position. Positive values show lines earlier.</description>
+    </key>
+    <key name="max-width" type="i">
+      <range min="200" max="1400"/>
+      <default>850</default>
+      <summary>Maximum compact width (px)</summary>
+    </key>
+    <key name="font-size" type="i">
+      <range min="8" max="18"/>
+      <default>11</default>
+      <summary>Compact lyric font size (pt)</summary>
+    </key>
+    <key name="theme" type="s">
+      <choices>
+        <choice value="system"/>
+        <choice value="dark"/>
+        <choice value="light"/>
+      </choices>
+      <default>'system'</default>
+      <summary>Island color theme</summary>
+      <description>system follows the desktop light/dark style.</description>
+    </key>
+  </schema>
+</schemalist>
