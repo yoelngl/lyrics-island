@@ -2,8 +2,8 @@
 
 GNOME Shell extension: a Dynamic Island-style pill in the top bar that shows time-synced lyrics for whatever is playing.
 
-- Works with any MPRIS media player; YouTube Music ([Pear Desktop](https://github.com/pear-devs/pear-desktop)) is preferred when several players are running.
-- Synced lyrics are fetched from `api.betterlyrics.org` and `lrc.red`.
+- Works with any MPRIS media player; YouTube Music ([Pear Desktop](https://github.com/pear-devs/pear-desktop)) and LiMusic are preferred when several players are running.
+- Synced lyrics are fetched from `api.betterlyrics.org` and `lrc.red`, falling back to LRCLIB, KuGou, Netease Cloud Music and QQ Music. Only time-synced lyrics are used; plain text is ignored.
 - When a track has no synced lyrics, the island shows its title and artist instead.
 - Play/pause, next and previous controls on the island.
 - Light, dark or system-following colour theme.

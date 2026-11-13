@@ -177,6 +177,9 @@ export const Island = GObject.registerClass({
         this._track = new St.Widget({style_class: 'li-track', x_expand: true, y_align: Clutter.ActorAlign.CENTER});
         this._fill = new St.Widget({style_class: 'li-fill', width: 0});
         this._track.add_child(this._fill);
+        this._frac = 0;
+        // The track resizes while the island animates open; recompute the fill instead of waiting for the next tick.
+        this._track.connect('notify::width', () => this._updateFill());
         progress.add_child(this._elapsed);
         progress.add_child(this._track);
         progress.add_child(this._total);
@@ -424,8 +427,12 @@ export const Island = GObject.registerClass({
     setProgress(pos, length) {
         this._elapsed.text = formatTime(pos);
         this._total.text = length > 0 ? formatTime(length) : '--:--';
-        const frac = length > 0 ? Math.min(1, Math.max(0, pos / length)) : 0;
-        this._fill.width = Math.round(this._track.width * frac);
+        this._frac = length > 0 ? Math.min(1, Math.max(0, pos / length)) : 0;
+        this._updateFill();
+    }
+
+    _updateFill() {
+        this._fill.width = Math.round(this._track.width * this._frac);
     }
 
     _onDestroy() {

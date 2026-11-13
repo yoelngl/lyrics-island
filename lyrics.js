@@ -5,8 +5,14 @@ import Soup from 'gi://Soup?version=3.0';
 
 const BETTER_API = 'https://api.betterlyrics.org';
 const LRC_RED = 'https://lrc.red';
+const KUGOU = 'https://lyrics.kugou.com';
+const LRCLIB = 'https://lrclib.net';
+const NETEASE = 'https://music.163.com';
+const QQ = 'https://c.y.qq.com';
 const BETTER_RETRY_S = 8;
 const NEGATIVE_TTL_MS = 3600 * 1000;
+// Credit lines that sources (KuGou, QQ, Netease) put in the timed lyrics, e.g. "Lyrics by：…", "作曲：…".
+const CREDIT = /^[^:：]{0,30}(lyrics|lyricist|written|writer|compos|music|arrang|produc|mix|master|record|engineer|vocal|guitar|bass|drum|keyboard|piano|string|publish|label|词|曲|编|制作|监制|混音|母带|和声|合声|吉他|贝斯|鼓|录音|出品|发行|企划|演唱|原唱)[^:：]{0,30}[:：]/i;
 
 const md5 = s => GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, s, -1);
 const enc = encodeURIComponent;
@@ -66,11 +72,17 @@ export function parseLrc(lrc) {
         // Strip enhanced-LRC word timings like <00:41.17>; note-only (instrumental) lines count as empty.
         const text = raw.slice(end).replace(/<\d+:\d+(?:[.:]\d+)?>/g, '').replace(/\s+/g, ' ').trim()
             .replace(/^[♪♫♬♩\s]+$/, '');
+        if (CREDIT.test(text))
+            continue;
         for (const t of times)
             out.push({t, text});
     }
     out.sort((a, b) => a.t - b.t);
-    return out.length ? out : null;
+    // Sources often open with a "Title - Artist" header line.
+    const first = out.findIndex(l => l.text);
+    if (first >= 0 && / - /.test(out[first].text))
+        out.splice(first, 1);
+    return out.some(l => l.text) ? out : null;
 }
 
 /** Converts Better Lyrics TTML to line-level LRC text, or null. */
@@ -126,9 +138,11 @@ export class LyricsProvider {
         GLib.mkdir_with_parents(this._artDir, 0o755);
     }
 
-    _request(url, cancellable) {
+    _request(url, cancellable, headers = {}) {
         return new Promise((resolve, reject) => {
             const msg = Soup.Message.new('GET', url);
+            for (const [k, v] of Object.entries(headers))
+                msg.get_request_headers().append(k, v);
             this._session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, cancellable, (s, res) => {
                 try {
                     const bytes = s.send_and_read_finish(res);
@@ -140,8 +154,8 @@ export class LyricsProvider {
         });
     }
 
-    async _requestJson(url, cancellable) {
-        const {status, bytes} = await this._request(url, cancellable);
+    async _requestJson(url, cancellable, headers) {
+        const {status, bytes} = await this._request(url, cancellable, headers);
         if (status !== 200)
             return null;
         return JSON.parse(new TextDecoder().decode(bytes.get_data() ?? new Uint8Array()));
@@ -190,8 +204,8 @@ export class LyricsProvider {
         if (cachedText && cachedText.trim().length > 0) {
             try {
                 const c = JSON.parse(cachedText);
-                // Refetch entries from before sources were recorded and ones from the removed LRCLIB source.
-                const usable = 'source' in c && c.source !== 'LRCLIB';
+                // Refetch entries from before sources were recorded.
+                const usable = 'source' in c;
                 if (usable && (c.syncedLyrics || Date.now() - c.fetchedAt < NEGATIVE_TTL_MS))
                     return {synced: parseLrc(c.syncedLyrics), source: c.source ?? null};
             } catch {
@@ -226,8 +240,58 @@ export class LyricsProvider {
         const better = async () => fromTtml((await soft(this._requestJson(
             `${BETTER_API}/getLyrics?s=${enc(title)}&a=${enc(artist)}&al=${enc(track.album ?? '')}&d=${dur}`,
             cancellable)))?.ttml, 'Better Lyrics');
+        const kugou = async () => {
+            const res = await soft(this._requestJson(
+                `${KUGOU}/search?ver=1&man=yes&client=pc&keyword=${enc(`${firstArtist} - ${title}`)}&duration=${dur * 1000}`,
+                cancellable));
+            const diff = x => Math.abs((x.duration ?? 0) / 1000 - dur);
+            const hit = (res?.candidates ?? [])
+                .filter(x => titleMatches(x.song, title) && diff(x) <= 3)
+                .sort((a, b) => diff(a) - diff(b))[0];
+            const lrc = hit && (await soft(this._requestJson(
+                `${KUGOU}/download?ver=1&client=pc&fmt=lrc&charset=utf8&id=${enc(hit.id)}&accesskey=${enc(hit.accesskey)}`,
+                cancellable)))?.content;
+            const text = lrc && new TextDecoder().decode(GLib.base64_decode(lrc));
+            return parseLrc(text) ? {syncedLyrics: text, source: 'KuGou'} : null;
+        };
 
-        let rec = dur > 0 ? await lrcRed() ?? await better() : null;
+        // Only entries with timestamps count; plain/unsynced lyrics are dropped. Candidates must match title, artist and length.
+        const synced = (text, source) => parseLrc(text) ? {syncedLyrics: text, source} : null;
+        const picks = (list, name, singers, secs) => (list ?? [])
+            .filter(x => titleMatches(name(x), title) && titleMatches(singers(x), firstArtist) && Math.abs(secs(x) - dur) <= 3)
+            .sort((a, b) => Math.abs(secs(a) - dur) - Math.abs(secs(b) - dur));
+        const lrclib = async () => {
+            const res = await soft(this._requestJson(
+                `${LRCLIB}/api/search?track_name=${enc(title)}&artist_name=${enc(firstArtist)}`, cancellable));
+            const hit = picks(Array.isArray(res) ? res.filter(x => x.syncedLyrics) : [],
+                x => x.trackName, x => x.artistName, x => x.duration)[0];
+            return hit ? synced(hit.syncedLyrics, 'LRCLIB') : null;
+        };
+        const netease = async () => {
+            const res = await soft(this._requestJson(
+                `${NETEASE}/api/search/get?s=${enc(`${firstArtist} ${title}`)}&type=1&limit=10`, cancellable));
+            // Copyright-restricted entries come back with empty lyrics; try the next match.
+            for (const hit of picks(res?.result?.songs, x => x.name, x => (x.artists ?? []).map(a => a.name).join(' '), x => x.duration / 1000).slice(0, 3)) {
+                const lrc = (await soft(this._requestJson(`${NETEASE}/api/song/lyric?id=${hit.id}&lv=1`, cancellable)))?.lrc?.lyric;
+                if (synced(lrc))
+                    return synced(lrc, 'Netease Cloud Music');
+            }
+            return null;
+        };
+        const qq = async () => {
+            const headers = {Referer: 'https://y.qq.com/'};
+            const res = await soft(this._requestJson(
+                `${QQ}/soso/fcgi-bin/client_search_cp?w=${enc(`${firstArtist} ${title}`)}&format=json&n=10&p=1&cr=1`,
+                cancellable, headers));
+            const hit = picks(res?.data?.song?.list, x => x.songname, x => (x.singer ?? []).map(s => s.name).join(' '), x => x.interval)[0];
+            const b64 = hit && (await soft(this._requestJson(
+                `${QQ}/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=${hit.songmid}&format=json&nobase64=0`,
+                cancellable, headers)))?.lyric;
+            return synced(b64 && new TextDecoder().decode(GLib.base64_decode(b64)), 'QQ Music');
+        };
+
+        let rec = dur > 0
+            ? await lrcRed() ?? await better() ?? await lrclib() ?? await kugou() ?? await netease() ?? await qq() : null;
 
         // The Better Lyrics browser extension fills the API cache when the song starts; give it time, then retry once.
         if (!rec && dur > 0) {

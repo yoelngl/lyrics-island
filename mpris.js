@@ -5,7 +5,8 @@ import * as Signals from 'resource:///org/gnome/shell/misc/signals.js';
 const MPRIS_PREFIX = 'org.mpris.MediaPlayer2.';
 const MPRIS_PATH = '/org/mpris/MediaPlayer2';
 const PLAYER_IFACE = 'org.mpris.MediaPlayer2.Player';
-const PREFERRED = /youtube|pear/i;
+const PREFERRED = /youtube|pear|limusic/i;
+const STALE_POSITION_MS = 5000;
 
 const PlayerProxy = Gio.DBusProxy.makeProxyWrapper(`
 <node>
@@ -90,8 +91,19 @@ class Player extends Signals.EventEmitter {
             new GLib.Variant('(ss)', [PLAYER_IFACE, 'Position']), new GLib.VariantType('(v)'),
             Gio.DBusCallFlags.NONE, 1000, this._cancellable, (conn, res) => {
                 try {
-                    const [pos] = conn.call_finish(res).recursiveUnpack();
-                    this._setPosition(Number(pos));
+                    const pos = Number(conn.call_finish(res).recursiveUnpack()[0]);
+                    // Some players never update Position (always 0), and 1 s resyncs to 0 would pin the bar near 0:00.
+                    // A 0 adds nothing over our own track-start reset, so trust it only once the player has reported a real value.
+                    if (pos > 0)
+                        this._positionWorks = true;
+                    else if (!this._positionWorks)
+                        return;
+                    // Polled values lag: by IPC latency, and some players (LiMusic) only refresh Position every few seconds.
+                    // While playing, our interpolation is accurate, so small backward corrections are stale data; real seeks come via Seeked.
+                    const delta = pos / 1000 - this.position();
+                    if (delta < 300 && delta > (this.status === 'Playing' ? -STALE_POSITION_MS : -300))
+                        return;
+                    this._setPosition(pos);
                 } catch {
                     // Player may not implement Position; keep interpolating.
                 }
