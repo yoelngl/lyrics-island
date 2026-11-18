@@ -928,7 +928,16 @@ impl Ui {
                     gradient: art.as_ref().and_then(|a| a.gradient),
                 };
                 isl.render(pm, text, &ctx);
-                (dmg.or(Some(cur_u)).filter(|_| !resized), Some(cur_b))
+                // Content is laid out at its final size while the shape morphs, so it can spill past the shape;
+                // anything outside cur_u would reach the screen via a damage blit and never be overwritten.
+                let (pw, ph) = (pm.width(), pm.height());
+                let (x, y, w, h) = cur_u;
+                clear_rect(pm, 0, 0, pw, y);
+                clear_rect(pm, 0, y + h, pw, ph);
+                clear_rect(pm, 0, y, x, h);
+                clear_rect(pm, x + w, y, pw, h);
+                // No prev_bounds (show, resize, drag end moving the pill in the canvas): blit everything.
+                (dmg, Some(cur_b))
             }
             WindowKind::Desktop => {
                 pm.fill(Color::TRANSPARENT);

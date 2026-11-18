@@ -24,7 +24,8 @@ use winit::window::Window;
 use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClipOrdering, ConnectionExt as _, CreateGCAux, ImageFormat, ImageOrder, PropMode, Rectangle,
+    AtomEnum, ChangeWindowAttributesAux, ClipOrdering, ConnectionExt as _, CreateGCAux, ImageFormat, ImageOrder,
+    PropMode, Rectangle,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -103,6 +104,10 @@ impl X11Presenter {
         let (conn, _) = x11rb::connect(None).expect("lyrics-island needs an X11 display");
         let gc = conn.generate_id().expect("X11 id");
         conn.create_gc(gc, win, &CreateGCAux::new()).expect("X11 create_gc");
+        // winit leaves background None, so on resize/remap the server seeds the new window pixmap with a copy
+        // of the screen (stale apps, old pill frames) and damage-only presents never overwrite it. Pixel 0 is
+        // transparent on the ARGB visual, so the server clears instead and sends Expose for a redraw.
+        let _ = conn.change_window_attributes(win, &ChangeWindowAttributesAux::new().background_pixel(0));
         let atom = |name: &[u8]| conn.intern_atom(false, name).ok().and_then(|c| c.reply().ok()).map_or(0, |r| r.atom);
         let state = [
             atom(b"_NET_WM_STATE"),
