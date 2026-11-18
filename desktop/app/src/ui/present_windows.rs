@@ -35,7 +35,7 @@ impl Presenter {
         Self { hwnd, dc, bmp: HBITMAP::default(), old: HGDIOBJ::default(), bits: ptr::null_mut(), size: (0, 0) }
     }
 
-    pub fn present(&mut self, _window: &Window, pm: &Pixmap) {
+    pub fn present(&mut self, _window: &Window, pm: &Pixmap, _damage: Option<(u32, u32, u32, u32)>) {
         let (w, h) = (pm.width(), pm.height());
         unsafe {
             // winit rewrites GWL_EXSTYLE whenever its window flags change, dropping WS_EX_LAYERED.

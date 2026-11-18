@@ -22,7 +22,7 @@ base64 = "0.23"
 [target.'cfg(target_os = "linux")'.dependencies]
 # zbus 6 dropped the blocking API; 5 is also what tray-icon's ksni already pulls in.
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
-x11rb = "0.14"
+x11rb = { version = "0.14", features = ["shape"] }
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 memmap2 = "0.9"

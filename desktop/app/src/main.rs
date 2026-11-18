@@ -4,6 +4,7 @@ mod art;
 mod autostart;
 mod config;
 mod hotkeys;
+mod instance;
 mod lyrics;
 mod media;
 mod model;
@@ -58,6 +59,7 @@ struct App {
     cfg: Config,
     cfg_mtime: Option<SystemTime>,
     autostart: bool,
+    open_settings_on_start: bool,
     ui: Option<ui::Ui>,
     media: Option<media::Media>,
     tray: Option<tray::Tray>,
@@ -353,6 +355,9 @@ impl ApplicationHandler<AppEvent> for App {
         let mut ui = ui::Ui::new(event_loop, &self.cfg, self.autostart);
         let (hk, hk_errs) = hotkeys::Hotkeys::new(&self.cfg.hotkeys, self.proxy.clone());
         ui.set_hotkey_errors(hk_errs);
+        if self.open_settings_on_start {
+            ui.open_settings(event_loop);
+        }
         self.ui = Some(ui);
         self.hotkeys = Some(hk);
         self.tray = tray::Tray::new(
@@ -431,6 +436,11 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 fn main() {
+    let open_settings_on_start = std::env::args().skip(1).any(|a| a == "--settings");
+    let Some(mut instance_guard) = instance::InstanceGuard::try_lock(open_settings_on_start) else {
+        return;
+    };
+
     #[allow(unused_mut)]
     let mut builder = EventLoop::<AppEvent>::with_user_event();
     #[cfg(target_os = "linux")]
@@ -459,12 +469,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let proxy = event_loop.create_proxy();
+    instance_guard.spawn_ipc(proxy.clone());
     let (cfg, cfg_mtime) = Config::load();
     let mut app = App {
-        proxy: event_loop.create_proxy(),
+        proxy,
         cfg,
         cfg_mtime,
         autostart: autostart::is_enabled(),
+        open_settings_on_start,
         ui: None,
         media: None,
         tray: None,
@@ -479,6 +492,8 @@ fn main() {
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("lyrics-island: {e}");
+        drop(instance_guard);
         std::process::exit(1);
     }
+    drop(instance_guard);
 }

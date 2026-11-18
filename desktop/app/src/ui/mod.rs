@@ -30,19 +30,24 @@ use crate::model::{
     self, Command, Line, Lyrics, PlayerChoice, PlayerState, Status, Theme, UiAction, UiConfig, WindowKind,
 };
 use desktop::Desktop;
-use island::{Bars, Hit, Island, PILL_MIN_W};
+use island::{Bars, Hit, Island, EXPANDED_H, EXPANDED_W, PILL_MIN_W};
 use settings::Settings;
 use text::Text;
 
-const FRAME: Duration = Duration::from_millis(33);
+/// 120 Hz step for shape morphs, text swaps, fades and scrubbing; 60 Hz for steady playback visuals.
+const FRAME_FAST: Duration = Duration::from_micros(8_333);
+const FRAME_PLAYING: Duration = Duration::from_micros(16_667);
 const COLLAPSE_DELAY: Duration = Duration::from_millis(1500);
-/// Logical px the pointer must travel with the button down before a press becomes a drag.
-const DRAG_PX: f64 = 4.0;
+/// Logical px the pointer must travel with the button down before a click becomes a window drag.
+const DRAG_PX: f64 = 7.0;
 const KEY_SEEK_MS: u64 = 5000;
+/// Headroom around `EXPANDED_H` inside the fixed island canvas so spring settle never clips.
+const CANVAS_PAD_H: f32 = 24.0;
 
 pub struct Ui {
     cfg: UiConfig,
-    mon: Mon,
+    mons: Vec<Mon>,
+    primary: Mon,
     text: Text,
     isl_s: Surface,
     desk_s: Surface,
@@ -51,8 +56,11 @@ pub struct Ui {
     desk: Desktop,
     settings: Settings,
     bars: Bars,
-    anchor: Anchor,
-    top: i32,
+    /// Stationary compact-pill horizontal center and top edge in physical screen px.
+    pill_anchor: (i32, i32),
+    /// Pill horizontal center inside `isl_s` (physical px) and whether the card expands upward.
+    canvas_cx: f32,
+    expand_up: bool,
     system_light: bool,
     mods: ModifiersState,
     scrub_frac: Option<f32>,
@@ -63,14 +71,12 @@ pub struct Ui {
     fallback: String,
     /// (line index, active) the labels were last filled from; None forces a refresh.
     line_key: Option<(Option<usize>, bool)>,
-    /// Latest picked line index (even when inactive) for prev/next line seeking.
     picked_idx: Option<usize>,
     /// Active line index and its sung part when karaoke applies.
     cur_line: Option<usize>,
     karaoke: Option<(Range<usize>, f32)>,
     elapsed_s: u64,
     start: Instant,
-    /// When the next animation frame is due; request_redraw wakes the loop at once, so frames must be gated here.
     next_frame: Instant,
 }
 
@@ -78,33 +84,38 @@ impl Ui {
     pub fn new(event_loop: &ActiveEventLoop, full_cfg: &Config, autostart: bool) -> Ui {
         let cfg = &full_cfg.ui;
         let now = Instant::now();
-        let mon = Mon::primary(event_loop);
-        let (anchor, top) = anchor_for(&mon, cfg.island_pos);
-        let ph = island::pill_height(cfg.island_font_pt) as f64;
-        let isl_size = ((PILL_MIN_W as f64 * mon.scale).round() as u32, (ph * mon.scale).round() as u32);
-        let mut isl_s = Surface::new(event_loop, "Lyrics Island", isl_size, (anchor.x(isl_size.0), top), true, now);
-        let (dsize, dpos) = desk_geometry(&mon, cfg, mon.scale);
+        let (primary, mons) = Mon::discover(event_loop);
+        let pill_anchor = resolve_pill_anchor(cfg.island_pos, &primary, &mons, cfg.island_font_pt);
+        let (isl_size, isl_pos, canvas_cx, expand_up) =
+            island_canvas_geometry(pill_anchor, cfg, &primary, &mons, primary.scale);
+        let mut isl_s = Surface::new(event_loop, "Lyrics Island", isl_size, isl_pos, true, now);
+        let (dsize, dpos) = desk_geometry(&primary, cfg, primary.scale);
         let mut desk_s = Surface::new(event_loop, "Lyrics Island Desktop Lyrics", dsize, dpos, true, now);
-        for s in [&mut isl_s, &mut desk_s] {
-            s.set_click_through(cfg.click_through);
-        }
+        desk_s.set_input_rect(None, primary.scale as f32, cfg.click_through);
+
+        let isl = Island::new(now);
+        let init_bounds = isl.bounds(isl_size, primary.scale as f32, canvas_cx, expand_up, now);
+        isl_s.set_input_rect(Some(init_bounds), primary.scale as f32, cfg.click_through);
+
         let system_light = detect_system_light(&isl_s.window);
         let mut settings = Settings::new(full_cfg, autostart);
         settings.set_status_line("No active media player");
 
         Ui {
             cfg: cfg.clone(),
-            mon,
+            mons,
+            primary,
             text: Text::new(),
             isl_s,
             desk_s,
             set_s: None,
-            isl: Island::new(now),
+            isl,
             desk: Desktop::new(),
             settings,
             bars: Bars::new(now),
-            anchor,
-            top,
+            pill_anchor,
+            canvas_cx,
+            expand_up,
             system_light,
             mods: ModifiersState::empty(),
             scrub_frac: None,
@@ -133,12 +144,12 @@ impl Ui {
     pub fn open_settings(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if self.set_s.is_none() {
-            let scale = self.mon.scale;
-            let w = ((settings::DEFAULT_W as f64 * scale).round() as u32).min((self.mon.w as f64 * 0.92) as u32);
-            let h = ((settings::DEFAULT_H as f64 * scale).round() as u32).min((self.mon.h as f64 * 0.9) as u32);
+            let scale = self.primary.scale;
+            let w = ((settings::DEFAULT_W as f64 * scale).round() as u32).min((self.primary.w as f64 * 0.92) as u32);
+            let h = ((settings::DEFAULT_H as f64 * scale).round() as u32).min((self.primary.h as f64 * 0.9) as u32);
             let pos = (
-                self.mon.x + (self.mon.w as i32 - w as i32) / 2,
-                self.mon.y + (self.mon.h as i32 - h as i32) / 2,
+                self.primary.x + (self.primary.w as i32 - w as i32) / 2,
+                self.primary.y + (self.primary.h as i32 - h as i32) / 2,
             );
             self.set_s = Some(Surface::new(event_loop, "Lyrics Island Settings", (w, h), pos, false, now));
         }
@@ -185,24 +196,24 @@ impl Ui {
         let now = Instant::now();
         let old = std::mem::replace(&mut self.cfg, cfg.clone());
         if old.click_through != cfg.click_through {
-            for s in [&mut self.isl_s, &mut self.desk_s] {
-                s.set_click_through(cfg.click_through);
-            }
+            let dscale = self.desk_s.window.scale_factor() as f32;
+            self.desk_s.set_input_rect(None, dscale, cfg.click_through);
+            self.sync_island_input_rect(now);
             if cfg.click_through {
                 self.collapse(now);
             }
         }
-        if old.island_pos != cfg.island_pos {
-            (self.anchor, self.top) = anchor_for(&self.mon, cfg.island_pos);
-            self.place_island(now);
-        }
-        if old.island_font_pt != cfg.island_font_pt || old.island_max_width != cfg.island_max_width {
-            self.fit_pill(now, true);
+        if old.island_pos != cfg.island_pos
+            || old.island_max_width != cfg.island_max_width
+            || old.island_font_pt != cfg.island_font_pt
+        {
+            self.pill_anchor = resolve_pill_anchor(cfg.island_pos, &self.primary, &self.mons, cfg.island_font_pt);
+            self.place_island_canvas(now);
+            self.fit_pill(now, old.island_pos == cfg.island_pos);
         }
         if old.desktop_pos != cfg.desktop_pos || old.desktop_font_px != cfg.desktop_font_px {
             self.place_desktop();
         }
-        // Offset, theme and karaoke change what gets picked and how it's drawn.
         self.line_key = None;
         self.isl_s.redraw();
         self.desk_s.redraw();
@@ -253,7 +264,7 @@ impl Ui {
         self.set_s.as_ref().is_some_and(|s| s.shown) && self.settings.is_recording_hotkey()
     }
 
-    pub fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) -> Vec<UiAction> {
+    pub fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) -> Vec<UiAction> {
         let mut out = Vec::new();
         let kind = if id == self.isl_s.window.id() {
             WindowKind::Island
@@ -272,7 +283,11 @@ impl Ui {
         let now = Instant::now();
         match event {
             WindowEvent::RedrawRequested => self.render(kind, now),
-            WindowEvent::Resized(_) => self.surface(kind).redraw(),
+            WindowEvent::Resized(_) => {
+                let s = self.surface(kind);
+                s.prev_bounds = None;
+                s.redraw();
+            }
             WindowEvent::ThemeChanged(theme) => {
                 self.system_light = matches!(theme, winit::window::Theme::Light);
                 self.isl_s.redraw();
@@ -282,7 +297,9 @@ impl Ui {
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::ScaleFactorChanged { .. } => {
+                (self.primary, self.mons) = Mon::discover(event_loop);
                 if island {
+                    self.place_island_canvas(now);
                     self.fit_pill(now, false);
                 } else {
                     self.place_desktop();
@@ -291,7 +308,6 @@ impl Ui {
             }
             WindowEvent::Moved(p) => {
                 let s = self.surface(kind);
-                // Programmatic moves land exactly where we asked; anything else while dragging is the user.
                 if s.dragging && (p.x, p.y) != s.pos {
                     s.dragged_to = Some((p.x, p.y));
                 }
@@ -306,23 +322,23 @@ impl Ui {
                 }
             }
             WindowEvent::CursorEntered { .. } => {
-                self.end_drag(kind, false, &mut out);
+                self.end_drag(event_loop, kind, false, now, &mut out);
                 if island {
                     self.isl.left_at = None;
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                self.end_drag(kind, false, &mut out);
+                self.end_drag(event_loop, kind, false, now, &mut out);
                 if island {
                     self.isl.left_at = Some(now);
                     self.set_hover(None);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.end_drag(kind, false, &mut out);
+                self.end_drag(event_loop, kind, false, now, &mut out);
                 self.surface(kind).cursor = position;
                 if island && self.scrub_frac.is_some() {
-                    self.scrub_frac = Some(self.progress_frac_under(now));
+                    self.scrub_frac = Some(self.progress_frac_under());
                     self.isl_s.redraw();
                     return out;
                 }
@@ -330,36 +346,42 @@ impl Ui {
                 if let Some(p0) = s.press {
                     if (position.x - p0.x).hypot(position.y - p0.y) > DRAG_PX * s.window.scale_factor() {
                         s.press = None;
+                        s.drag_origin_pos = s.pos;
                         s.dragged_to = None;
                         s.dragging = s.window.drag_window().is_ok();
                         self.isl.pressed = None;
                     }
                 }
                 if island {
-                    let h = self.hit_under(now);
+                    let h = self.hit_under();
                     self.set_hover(h);
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.end_drag(kind, true, &mut out);
+                self.end_drag(event_loop, kind, true, now, &mut out);
                 match state {
                     ElementState::Pressed => {
-                        if island && self.isl.expanded {
-                            let hit = self.hit_under(now);
-                            if hit == Some(Hit::Progress) {
-                                self.isl_s.press = None;
-                                self.isl.pressed = Some(Hit::Progress);
-                                self.scrub_frac = Some(self.progress_frac_under(now));
+                        if island {
+                            if !self.point_in_island_shape(now) {
+                                return out;
+                            }
+                            if self.isl.expanded {
+                                let hit = self.hit_under();
+                                if hit == Some(Hit::Progress) {
+                                    self.isl_s.press = None;
+                                    self.isl.pressed = Some(Hit::Progress);
+                                    self.scrub_frac = Some(self.progress_frac_under());
+                                    self.isl_s.redraw();
+                                    return out;
+                                }
+                                self.isl_s.press = Some(self.isl_s.cursor);
+                                self.isl.pressed = hit;
                                 self.isl_s.redraw();
                                 return out;
                             }
-                            self.isl_s.press = Some(self.isl_s.cursor);
-                            self.isl.pressed = hit;
-                            self.isl_s.redraw();
-                        } else {
-                            let s = self.surface(kind);
-                            s.press = Some(s.cursor);
                         }
+                        let s = self.surface(kind);
+                        s.press = Some(s.cursor);
                     }
                     ElementState::Released => {
                         if island {
@@ -394,6 +416,7 @@ impl Ui {
             WindowEvent::RedrawRequested => self.render(WindowKind::Settings, now),
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(s) = self.set_s.as_mut() {
+                    s.prev_bounds = None;
                     s.redraw();
                 }
             }
@@ -528,14 +551,17 @@ impl Ui {
                 }
             }
         }
-        self.place_island(now);
+        self.sync_island_input_rect(now);
 
-        let isl_live = self.isl_s.shown
-            && (playing || self.isl.animating(now) || self.bars.animating(now) || !self.isl_s.fade.done(now));
+        let fast_anim = (self.isl_s.shown
+            && (self.isl.transitioning(now) || !self.isl_s.fade.done(now) || self.scrub_frac.is_some()))
+            || (self.desk_s.shown && !self.desk_s.fade.done(now));
+        let isl_live = self.isl_s.shown && (fast_anim || playing || self.bars.animating(now));
         let desk_live = self.desk_s.shown && (!self.desk_s.fade.done(now) || (playing && self.karaoke.is_some()));
-        // Continuous animation only redraws on frame ticks; event-driven redraw() calls still go out immediately.
+        let frame_dt = if fast_anim { FRAME_FAST } else { FRAME_PLAYING };
+
         if (isl_live || desk_live) && now >= self.next_frame {
-            self.next_frame = now + FRAME;
+            self.next_frame = now + frame_dt;
             self.isl_s.dirty |= isl_live;
             self.desk_s.dirty |= desk_live;
         }
@@ -568,7 +594,6 @@ impl Ui {
         }
     }
 
-    /// Picks the line like extension.js _tick and refills the labels when it changes.
     fn refresh_lines(&mut self, t: i64, now: Instant) {
         let lyrics = self.lyrics.clone();
         let lines: &[Line] = lyrics.as_deref().map_or(&[][..], |l| l.lines.as_slice());
@@ -614,27 +639,33 @@ impl Ui {
     }
 
     fn fit_pill(&mut self, now: Instant, animate: bool) {
-        let screen_max = (self.mon.w as f64 / self.mon.scale * 0.75) as f32;
-        let max = self.cfg.island_max_width.min(screen_max);
-        self.isl.fit_pill(
-            &mut self.text,
-            self.isl_s.window.scale_factor() as f32,
-            self.cfg.island_font_pt,
-            max,
-            now,
-            animate,
-        );
+        let mon = monitor_at(self.pill_anchor, &self.primary, &self.mons);
+        let scale = self.isl_s.window.scale_factor();
+        let canvas_w_l = (self.isl_s.size.0 as f64 / scale) as f32;
+        let screen_max = (mon.w as f64 / mon.scale * 0.85) as f32;
+        let max = self.cfg.island_max_width.min(screen_max).min(canvas_w_l);
+        self.isl.fit_pill(&mut self.text, scale as f32, self.cfg.island_font_pt, max, now, animate);
+        self.sync_island_input_rect(now);
     }
 
-    /// Sizes the island window to hold the animating shape and keeps it anchored.
-    fn place_island(&mut self, now: Instant) {
-        let s = self.isl_s.window.scale_factor() as f32;
-        let size = ((self.isl.w.reach(now) * s).ceil() as u32, (self.isl.h.reach(now) * s).ceil() as u32);
-        self.isl_s.place(size, (self.anchor.x(size.0), self.top));
+    fn place_island_canvas(&mut self, now: Instant) {
+        let scale = self.isl_s.window.scale_factor();
+        let (size, pos, cx, expand_up) =
+            island_canvas_geometry(self.pill_anchor, &self.cfg, &self.primary, &self.mons, scale);
+        self.canvas_cx = cx;
+        self.expand_up = expand_up;
+        self.isl_s.place(size, pos);
+        self.sync_island_input_rect(now);
+    }
+
+    fn sync_island_input_rect(&mut self, now: Instant) {
+        let scale = self.isl_s.window.scale_factor() as f32;
+        let bounds = self.isl.bounds(self.isl_s.size, scale, self.canvas_cx, self.expand_up, now);
+        self.isl_s.set_input_rect(Some(bounds), scale, self.cfg.click_through);
     }
 
     fn place_desktop(&mut self) {
-        let (size, pos) = desk_geometry(&self.mon, &self.cfg, self.desk_s.window.scale_factor());
+        let (size, pos) = desk_geometry(&self.primary, &self.cfg, self.desk_s.window.scale_factor());
         self.desk_s.place(size, pos);
     }
 
@@ -643,7 +674,7 @@ impl Ui {
             return;
         }
         self.isl.expand(now);
-        // Focus lets a click anywhere else arrive as Focused(false) and collapse us, and enables keyboard controls.
+        self.sync_island_input_rect(now);
         self.isl_s.window.focus_window();
         self.isl_s.redraw();
     }
@@ -686,7 +717,7 @@ impl Ui {
             self.expand(now);
             return None;
         }
-        match self.hit_under(now) {
+        match self.hit_under() {
             Some(h) if self.isl.pressed == Some(h) => self.activate_hit(h),
             Some(_) => None,
             None => {
@@ -739,22 +770,30 @@ impl Ui {
         }
     }
 
-    fn cursor_logical_in_island(&self, now: Instant) -> (f32, f32) {
+    fn point_in_island_shape(&self, now: Instant) -> bool {
         let s = self.isl_s.window.scale_factor() as f32;
-        let w = self.isl_s.window.inner_size().width as f32;
-        let ox = self.isl.origin_x(w, s, matches!(self.anchor, Anchor::Left(_)), now);
+        let sz = self.isl_s.window.inner_size();
+        let (ox, oy, w, h) = self.isl.shape_rect((sz.width, sz.height), s, self.canvas_cx, self.expand_up, now);
         let c = self.isl_s.cursor;
-        ((c.x as f32 - ox) / s, c.y as f32 / s)
+        (ox..=ox + w).contains(&(c.x as f32)) && (oy..=oy + h).contains(&(c.y as f32))
     }
 
-    fn hit_under(&self, now: Instant) -> Option<Hit> {
-        let (x, y) = self.cursor_logical_in_island(now);
+    fn cursor_logical_in_expanded(&self) -> (f32, f32) {
+        let s = self.isl_s.window.scale_factor() as f32;
+        let sz = self.isl_s.window.inner_size();
+        let (eox, eoy) = self.isl.expanded_origin((sz.width, sz.height), s, self.canvas_cx, self.expand_up);
+        let c = self.isl_s.cursor;
+        ((c.x as f32 - eox) / s, (c.y as f32 - eoy) / s)
+    }
+
+    fn hit_under(&self) -> Option<Hit> {
+        let (x, y) = self.cursor_logical_in_expanded();
         let (has_prev, has_next, has_len) = self.line_nav_flags();
         self.isl.hit_at(x, y, has_prev, has_next, has_len)
     }
 
-    fn progress_frac_under(&self, now: Instant) -> f32 {
-        let (x, _) = self.cursor_logical_in_island(now);
+    fn progress_frac_under(&self) -> f32 {
+        let (x, _) = self.cursor_logical_in_expanded();
         self.isl.progress_frac(x)
     }
 
@@ -765,20 +804,36 @@ impl Ui {
         }
     }
 
-    /// A window drag ends at the first input after the WM moved us (or any button event);
-    /// report the new top-left once.
-    fn end_drag(&mut self, kind: WindowKind, force: bool, out: &mut Vec<UiAction>) {
+    /// Applies the drag delta `(dx, dy)` to the stationary compact-pill anchor so dragging
+    /// while expanded or collapsed never shifts the small lyrics relative to where you dropped it.
+    fn end_drag(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        kind: WindowKind,
+        force: bool,
+        now: Instant,
+        out: &mut Vec<UiAction>,
+    ) {
         let s = self.surface(kind);
         if !s.dragging || !(force || s.dragged_to.is_some()) {
             return;
         }
         s.dragging = false;
+        let origin = s.drag_origin_pos;
         let Some(p) = s.dragged_to.take() else { return };
         s.pos = p;
         if kind == WindowKind::Island {
-            (self.anchor, self.top) = (Anchor::Left(p.0), p.1);
+            (self.primary, self.mons) = Mon::discover(event_loop);
+            let raw = (self.pill_anchor.0 + (p.0 - origin.0), self.pill_anchor.1 + (p.1 - origin.1));
+            let next_anchor = resolve_pill_anchor(Some(raw), &self.primary, &self.mons, self.cfg.island_font_pt);
+            self.pill_anchor = next_anchor;
+            self.place_island_canvas(now);
+            self.isl_s.prev_bounds = None;
+            self.isl_s.redraw();
+            out.push(UiAction::Moved(WindowKind::Island, next_anchor));
+        } else {
+            out.push(UiAction::Moved(kind, p));
         }
-        out.push(UiAction::Moved(kind, p));
     }
 
     fn render(&mut self, kind: WindowKind, now: Instant) {
@@ -799,7 +854,8 @@ impl Ui {
             cfg,
             karaoke,
             cur_line,
-            anchor,
+            canvas_cx,
+            expand_up,
             start,
             scrub_frac,
             ..
@@ -812,26 +868,41 @@ impl Ui {
                 s
             }
         };
-        // Cleared even when skipped: show() and Resized call redraw() again, and a stuck flag would spin update().
         s.dirty = false;
         let size = s.window.inner_size();
         if !s.shown || size.width == 0 || size.height == 0 {
             return;
         }
-        if s.pixmap.as_ref().is_none_or(|p| p.width() != size.width || p.height() != size.height) {
+        let resized = s.pixmap.as_ref().is_none_or(|p| p.width() != size.width || p.height() != size.height);
+        if resized {
             s.pixmap = Pixmap::new(size.width, size.height);
+            s.prev_bounds = None;
         }
         let Some(pm) = s.pixmap.as_mut() else { return };
-        pm.fill(Color::TRANSPARENT);
         let scale = s.window.scale_factor() as f32;
         let line = (*cur_line).and_then(|i| lyrics.as_ref()?.lines.get(i)).map(|l| l.text.as_str());
         let kara = match (karaoke, line) {
             (Some((r, f)), Some(l)) => Some((l, r.clone(), *f)),
             _ => None,
         };
-        match kind {
+
+        let (damage, input_rect) = match kind {
             WindowKind::Island => {
-                let small_px = ((island::pill_height(cfg.island_font_pt) - 8.0) * scale).round() as u32;
+                let cur_b = isl.bounds((size.width, size.height), scale, *canvas_cx, *expand_up, now);
+                let cur_u = (cur_b.0.max(0) as u32, cur_b.1.max(0) as u32, cur_b.2, cur_b.3);
+                let dmg = match s.prev_bounds {
+                    Some(prev) => Some(union_rect(prev, cur_u)),
+                    None => {
+                        pm.fill(Color::TRANSPARENT);
+                        None
+                    }
+                };
+                if let Some((dx, dy, dw, dh)) = dmg {
+                    clear_rect(pm, dx, dy, dw, dh);
+                }
+                s.prev_bounds = Some(cur_u);
+
+                let small_px = (island::compact_art_size(cfg.island_font_pt) * scale).round() as u32;
                 if let Some(a) = art.as_mut() {
                     a.prepare(small_px, (56.0 * scale).round() as u32);
                 }
@@ -841,7 +912,8 @@ impl Ui {
                     scale,
                     light,
                     font_pt: cfg.island_font_pt,
-                    left_anchor: matches!(anchor, Anchor::Left(_)),
+                    center_x: *canvas_cx,
+                    expand_up: *expand_up,
                     clock: now.duration_since(*start).as_secs_f32(),
                     playing: p.is_some_and(|p| p.status == Status::Playing),
                     pos_ms: p.map_or(0, |p| p.position_now()),
@@ -856,17 +928,68 @@ impl Ui {
                     gradient: art.as_ref().and_then(|a| a.gradient),
                 };
                 isl.render(pm, text, &ctx);
+                (dmg.or(Some(cur_u)).filter(|_| !resized), Some(cur_b))
             }
-            WindowKind::Desktop => desk.render(pm, text, scale, cfg.desktop_font_px, !cfg.click_through, kara),
-            WindowKind::Settings => settings.render(pm, text, scale, light),
-        }
+            WindowKind::Desktop => {
+                pm.fill(Color::TRANSPARENT);
+                desk.render(pm, text, scale, cfg.desktop_font_px, !cfg.click_through, kara);
+                (None, None)
+            }
+            WindowKind::Settings => {
+                pm.fill(Color::TRANSPARENT);
+                settings.render(pm, text, scale, light);
+                (None, None)
+            }
+        };
+
         let a = s.fade.value(now);
         if a < 0.999 {
-            for b in pm.data_mut() {
-                *b = (*b as f32 * a) as u8;
+            if let Some((dx, dy, dw, dh)) = damage {
+                scale_rect_alpha(pm, dx, dy, dw, dh, a);
+            } else {
+                for b in pm.data_mut() {
+                    *b = (*b as f32 * a) as u8;
+                }
             }
         }
-        s.presenter.present(&s.window, pm);
+        s.presenter.present(&s.window, pm, damage);
+        if let Some(cur_b) = input_rect {
+            s.set_input_rect(Some(cur_b), scale, cfg.click_through);
+        }
+    }
+}
+
+fn union_rect(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let x0 = a.0.min(b.0);
+    let y0 = a.1.min(b.1);
+    let x1 = (a.0 + a.2).max(b.0 + b.2);
+    let y1 = (a.1 + a.3).max(b.1 + b.3);
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+fn clear_rect(pm: &mut Pixmap, x: u32, y: u32, w: u32, h: u32) {
+    let (pw, ph) = (pm.width() as usize, pm.height() as usize);
+    let x0 = (x as usize).min(pw);
+    let y0 = (y as usize).min(ph);
+    let x1 = (x0 + w as usize).min(pw);
+    let y1 = (y0 + h as usize).min(ph);
+    let data = pm.data_mut();
+    for row in y0..y1 {
+        data[(row * pw + x0) * 4..(row * pw + x1) * 4].fill(0);
+    }
+}
+
+fn scale_rect_alpha(pm: &mut Pixmap, x: u32, y: u32, w: u32, h: u32, a: f32) {
+    let (pw, ph) = (pm.width() as usize, pm.height() as usize);
+    let x0 = (x as usize).min(pw);
+    let y0 = (y as usize).min(ph);
+    let x1 = (x0 + w as usize).min(pw);
+    let y1 = (y0 + h as usize).min(ph);
+    let data = pm.data_mut();
+    for row in y0..y1 {
+        for b in &mut data[(row * pw + x0) * 4..(row * pw + x1) * 4] {
+            *b = (*b as f32 * a) as u8;
+        }
     }
 }
 
@@ -875,18 +998,17 @@ struct Surface {
     window: Window,
     presenter: present::Presenter,
     pixmap: Option<Pixmap>,
+    prev_bounds: Option<(u32, u32, u32, u32)>,
     overlay: bool,
-    /// Mapped right now.
     shown: bool,
-    /// Should be visible; overlay windows stay mapped until their fade-out ends.
     want: bool,
     fade: Anim,
     dirty: bool,
     cursor: PhysicalPosition<f64>,
     press: Option<PhysicalPosition<f64>>,
     dragging: bool,
+    drag_origin_pos: (i32, i32),
     dragged_to: Option<(i32, i32)>,
-    /// Last requested inner size and outer position, physical px.
     size: (u32, u32),
     pos: (i32, i32),
 }
@@ -927,6 +1049,7 @@ impl Surface {
             window,
             presenter,
             pixmap: None,
+            prev_bounds: None,
             overlay,
             shown: false,
             want: false,
@@ -935,16 +1058,19 @@ impl Surface {
             cursor: PhysicalPosition::new(0.0, 0.0),
             press: None,
             dragging: false,
+            drag_origin_pos: pos,
             dragged_to: None,
             size,
             pos,
         }
     }
 
-    fn set_click_through(&mut self, click_through: bool) {
+    fn set_input_rect(&mut self, rect: Option<(i32, i32, u32, u32)>, scale: f32, click_through: bool) {
         let _ = self.window.set_cursor_hittest(!click_through);
         #[cfg(target_os = "linux")]
-        self.presenter.set_click_through(click_through);
+        self.presenter.set_input_rect(rect, scale, click_through);
+        #[cfg(not(target_os = "linux"))]
+        let _ = (rect, scale);
     }
 
     fn redraw(&mut self) {
@@ -962,10 +1088,11 @@ impl Surface {
         if want && !self.shown {
             #[cfg(target_os = "linux")]
             self.presenter.prepare_show(self.overlay);
+            self.prev_bounds = None;
             self.window.set_visible(true);
             self.shown = true;
         }
-        self.fade.set(if want { 1.0 } else { 0.0 }, 250, 0, ease_out_quad, now);
+        self.fade.set(if want { 1.0 } else { 0.0 }, 220, 0, ease_out_quad, now);
         self.redraw();
     }
 
@@ -975,6 +1102,7 @@ impl Surface {
         if !self.shown {
             #[cfg(target_os = "linux")]
             self.presenter.prepare_show(self.overlay);
+            self.prev_bounds = None;
             self.window.set_visible(true);
             self.shown = true;
         }
@@ -991,10 +1119,10 @@ impl Surface {
     fn place(&mut self, size: (u32, u32), pos: (i32, i32)) {
         if size != self.size {
             self.size = size;
+            self.prev_bounds = None;
             let _ = self.window.request_inner_size(PhysicalSize::new(size.0, size.1));
             self.redraw();
         }
-        // Don't fight the window manager while the user drags.
         if pos != self.pos && !self.dragging {
             self.pos = pos;
             self.window.set_outer_position(PhysicalPosition::new(pos.0, pos.1));
@@ -1035,7 +1163,6 @@ fn linux_portal_light() -> Option<bool> {
         v = inner;
     }
     match v {
-        // XDG color-scheme: 1 = prefer dark, 2 = prefer light, 0 = default (light on GNOME/GTK).
         zbus::zvariant::Value::U32(1) => Some(false),
         zbus::zvariant::Value::U32(0 | 2) => Some(true),
         _ => None,
@@ -1052,43 +1179,79 @@ struct Mon {
 }
 
 impl Mon {
-    fn primary(el: &ActiveEventLoop) -> Mon {
-        el.primary_monitor().or_else(|| el.available_monitors().next()).map_or(
-            Mon { x: 0, y: 0, w: 1920, h: 1080, scale: 1.0 },
-            |m| {
-                let (p, s) = (m.position(), m.size());
-                Mon { x: p.x, y: p.y, w: s.width, h: s.height, scale: m.scale_factor() }
-            },
-        )
+    fn discover(el: &ActiveEventLoop) -> (Mon, Vec<Mon>) {
+        let to_mon = |m: winit::monitor::MonitorHandle| {
+            let (p, s) = (m.position(), m.size());
+            Mon { x: p.x, y: p.y, w: s.width, h: s.height, scale: m.scale_factor() }
+        };
+        let list: Vec<Mon> = el.available_monitors().map(to_mon).collect();
+        let primary = el
+            .primary_monitor()
+            .map(to_mon)
+            .or_else(|| list.first().copied())
+            .unwrap_or(Mon { x: 0, y: 0, w: 1920, h: 1080, scale: 1.0 });
+        let list = if list.is_empty() { vec![primary] } else { list };
+        (primary, list)
     }
 }
 
-/// How the island keeps its place while its width animates.
-#[derive(Clone, Copy)]
-enum Anchor {
-    /// Default placement: centered on this physical x.
-    Center(i32),
-    /// User-dragged: this physical left edge.
-    Left(i32),
+fn monitor_at(pt: (i32, i32), primary: &Mon, mons: &[Mon]) -> Mon {
+    mons.iter()
+        .copied()
+        .find(|m| pt.0 >= m.x && pt.0 < m.x + m.w as i32 && pt.1 >= m.y && pt.1 < m.y + m.h as i32)
+        .or_else(|| {
+            // Pick nearest monitor if point slightly spilled outside screen edges during WM drag.
+            mons.iter().copied().min_by_key(|m| {
+                let cx = m.x + m.w as i32 / 2;
+                let cy = m.y + m.h as i32 / 2;
+                (pt.0 as i64 - cx as i64).pow(2) + (pt.1 as i64 - cy as i64).pow(2)
+            })
+        })
+        .unwrap_or(*primary)
 }
 
-impl Anchor {
-    fn x(self, width: u32) -> i32 {
-        match self {
-            Anchor::Center(cx) => cx - width as i32 / 2,
-            Anchor::Left(x) => x,
-        }
-    }
+/// Clamps or defaults the stationary compact-pill `(center_x, pill_top_y)` inside its monitor.
+fn resolve_pill_anchor(pos: Option<(i32, i32)>, primary: &Mon, mons: &[Mon], font_pt: f32) -> (i32, i32) {
+    let Some(raw) = pos else {
+        return (primary.x + primary.w as i32 / 2, primary.y + (8.0 * primary.scale).round() as i32);
+    };
+    let mon = monitor_at(raw, primary, mons);
+    let min_half = ((PILL_MIN_W as f64 * 0.5 + 6.0) * mon.scale).round() as i32;
+    let ph = (island::pill_height(font_pt) as f64 * mon.scale).round() as i32;
+    let cx = raw.0.clamp(mon.x + min_half, (mon.x + mon.w as i32 - min_half).max(mon.x + min_half));
+    let top = raw.1.clamp(mon.y + 2, (mon.y + mon.h as i32 - ph - 2).max(mon.y + 2));
+    (cx, top)
 }
 
-fn anchor_for(mon: &Mon, pos: Option<(i32, i32)>) -> (Anchor, i32) {
-    match pos {
-        Some((x, y)) => (Anchor::Left(x), y),
-        None => (Anchor::Center(mon.x + mon.w as i32 / 2), mon.y + (8.0 * mon.scale).round() as i32),
-    }
+/// Computes the fixed `(canvas_size, window_pos, canvas_center_x, expand_up)` for the island window.
+fn island_canvas_geometry(
+    anchor: (i32, i32),
+    cfg: &UiConfig,
+    primary: &Mon,
+    mons: &[Mon],
+    scale: f64,
+) -> ((u32, u32), (i32, i32), f32, bool) {
+    let mon = monitor_at(anchor, primary, mons);
+    let max_logical_w = cfg.island_max_width.max(EXPANDED_W + 32.0);
+    let cw = ((max_logical_w as f64 * scale).ceil() as u32)
+        .min((mon.w as f64 * 0.92) as u32)
+        .max(200);
+    let ch = (((EXPANDED_H + CANVAS_PAD_H) as f64 * scale).ceil() as u32)
+        .min(mon.h.max(200));
+    let ph = (island::pill_height(cfg.island_font_pt) as f64 * scale).round() as i32;
+
+    let win_x = (anchor.0 - cw as i32 / 2)
+        .clamp(mon.x, (mon.x + mon.w as i32 - cw as i32).max(mon.x));
+    let expand_up = anchor.1 + ch as i32 > mon.y + mon.h as i32;
+    let win_y = if expand_up {
+        (anchor.1 + ph - ch as i32).max(mon.y)
+    } else {
+        anchor.1
+    };
+    let canvas_cx = (anchor.0 - win_x) as f32;
+    ((cw, ch), (win_x, win_y), canvas_cx, expand_up)
 }
 
-/// Desktop lyrics: 70% of the monitor wide, bottom-center 12% above the bottom unless placed.
 fn desk_geometry(mon: &Mon, cfg: &UiConfig, scale: f64) -> ((u32, u32), (i32, i32)) {
     let w = (mon.w as f64 * 0.7) as u32;
     let h = (desktop::height(cfg.desktop_font_px) as f64 * scale).ceil() as u32;
@@ -1099,7 +1262,6 @@ fn desk_geometry(mon: &Mon, cfg: &UiConfig, scale: f64) -> ((u32, u32), (i32, i3
     ((w, h), pos)
 }
 
-/// Album art: thumbnails at the sizes the island draws and the raw two-tone gradient colors.
 struct Art {
     src: Arc<model::Rgba>,
     gradient: Option<([u8; 3], [u8; 3])>,
@@ -1138,7 +1300,6 @@ impl Art {
     }
 }
 
-/// Center-cropped square thumbnail (CSS background-size: cover), box-filtered, premultiplied.
 fn thumb(src: &model::Rgba, n: u32) -> Option<Pixmap> {
     let (w, h) = (src.width as usize, src.height as usize);
     if w == 0 || h == 0 || src.data.len() < w * h * 4 {
@@ -1171,9 +1332,6 @@ fn thumb(src: &model::Rgba, n: u32) -> Option<Pixmap> {
     Some(pm)
 }
 
-/// Line index at `t` and whether it counts as active (extension.js _tick): a known end wins,
-/// bridged to the next line across gaps < 3 s; without an end the line stays until the next one,
-/// capped at 9 s (8 s for the last line).
 fn pick(lines: &[Line], t: i64) -> (Option<usize>, bool) {
     let Some(i) = lines.partition_point(|l| l.start_ms as i64 <= t).checked_sub(1) else {
         return (None, false);
@@ -1192,8 +1350,6 @@ fn pick(lines: &[Line], t: i64) -> (Option<usize>, bool) {
     (Some(i), !cur.text.is_empty() && t < start + max)
 }
 
-/// Byte range of the word being sung (trailing space excluded) and how far into it we are.
-/// Nothing started yet gives an empty range, which highlights nothing.
 fn sung(line: &Line, t: i64) -> (Range<usize>, f32) {
     let mut off = 0;
     let mut res = (0..0, 0.0);
@@ -1255,27 +1411,23 @@ impl Anim {
     fn done(&self, now: Instant) -> bool {
         now >= self.start + Duration::from_secs_f32(self.dur)
     }
-
-    /// Largest value still reachable, with headroom for ease_out_back's overshoot.
-    fn reach(&self, now: Instant) -> f32 {
-        if self.done(now) {
-            self.to
-        } else {
-            self.from.max(self.to) + 0.11 * (self.to - self.from).abs()
-        }
-    }
 }
 
 fn ease_out_quad(p: f32) -> f32 {
     1.0 - (1.0 - p) * (1.0 - p)
 }
 
+fn ease_out_quart(p: f32) -> f32 {
+    1.0 - (1.0 - p).powi(4)
+}
+
 fn ease_in_out_quad(p: f32) -> f32 {
     if p < 0.5 { 2.0 * p * p } else { 1.0 - (2.0 - 2.0 * p).powi(2) / 2.0 }
 }
 
-fn ease_out_back(p: f32) -> f32 {
-    const C1: f32 = 1.70158;
+/// Critically-settled Dynamic Island curve (~2.5% gentle settle, zero rubbery bounce).
+fn ease_out_spring(p: f32) -> f32 {
+    const C1: f32 = 0.52;
     1.0 + (C1 + 1.0) * (p - 1.0).powi(3) + C1 * (p - 1.0).powi(2)
 }
 
@@ -1284,7 +1436,6 @@ fn rrect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
         return None;
     }
     let r = r.min(w / 2.0).min(h / 2.0);
-    // Cubic quarter-circle: control points 0.5523 * r from the corner ends.
     let k = r * 0.4477;
     let (x1, y1) = (x + w, y + h);
     let mut pb = PathBuilder::new();
@@ -1315,21 +1466,31 @@ mod tests {
         let ended = [line(1000, Some(3000), "a"), line(5000, Some(6000), "b"), line(20000, None, "c")];
         assert_eq!(pick(&ended, 500), (None, false));
         assert_eq!(pick(&ended, 2000), (Some(0), true));
-        // 2 s breath to the next line is bridged.
         assert_eq!(pick(&ended, 4500), (Some(0), true));
-        // 14 s gap is not.
         assert_eq!(pick(&ended, 7000), (Some(1), false));
-        // Last line without end: 8 s.
         assert_eq!(pick(&ended, 27999), (Some(2), true));
         assert_eq!(pick(&ended, 28000), (Some(2), false));
 
         let open = [line(0, None, "x"), line(30000, None, "y"), line(31000, None, "")];
-        // No end: until the next line, capped at 9 s.
         assert_eq!(pick(&open, 8999), (Some(0), true));
         assert_eq!(pick(&open, 9000), (Some(0), false));
         assert_eq!(pick(&open, 30500), (Some(1), true));
-        // Empty text never counts as active.
         assert_eq!(pick(&open, 31500), (Some(2), false));
+    }
+
+    #[test]
+    fn bottom_screen_anchor_expands_upward_without_moving_pill() {
+        let mon = Mon { x: 0, y: 0, w: 1366, h: 768, scale: 1.0 };
+        let cfg = UiConfig::default();
+        let anchor = resolve_pill_anchor(Some((683, 661)), &mon, &[mon], cfg.island_font_pt);
+        let (size, pos, cx, expand_up) = island_canvas_geometry(anchor, &cfg, &mon, &[mon], 1.0);
+        assert!(expand_up, "pill at y=661 on 768px screen expands upward");
+        let isl = Island::new(Instant::now());
+        let (cox, coy, cw, ch) = isl.compact_rect(size, 1.0, cx, expand_up);
+        // Screen Y of the compact pill matches anchor.1 (661) and screen center X matches anchor.0 (683).
+        assert_eq!(pos.1 + coy as i32, anchor.1);
+        assert_eq!(pos.0 + (cox + cw / 2.0).round() as i32, anchor.0);
+        assert_eq!(ch as i32, island::pill_height(cfg.island_font_pt) as i32);
     }
 
     #[test]
@@ -1350,7 +1511,6 @@ mod tests {
 
     #[test]
     fn thumb_crops_and_averages() {
-        // 4x2: left half red, right half blue; the center crop is 2x2 of one red and one blue column.
         let mut data = Vec::new();
         for _ in 0..2 {
             for c in [[255, 0, 0], [255, 0, 0], [0, 0, 255], [0, 0, 255]] {

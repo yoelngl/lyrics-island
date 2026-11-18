@@ -44,7 +44,7 @@ On macOS, `target/release/libmr_helper.dylib` must sit in `Lyrics Island.app/Con
 
 ## Settings and config
 
-Choose **Settings...** in the tray menu to configure appearance, lyric timing, media source, launch at login, local `.lrc` folders and global shortcuts (including an interactive shortcut recorder).
+Choose **Settings...** in the tray menu (or run `lyrics-island --settings`) to configure appearance, lyric timing, media source, launch at login, local `.lrc` folders and global shortcuts (including an interactive shortcut recorder). Only one instance of `lyrics-island` can run at a time; starting a second process exits immediately.
 
 Settings are stored as `config.json` in:
 

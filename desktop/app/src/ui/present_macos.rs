@@ -45,7 +45,7 @@ impl Presenter {
         Self { view, layer, space }
     }
 
-    pub fn present(&mut self, window: &Window, pm: &Pixmap) {
+    pub fn present(&mut self, window: &Window, pm: &Pixmap, _damage: Option<(u32, u32, u32, u32)>) {
         let (w, h) = (pm.width() as usize, pm.height() as usize);
         let data = CFData::from_bytes(pm.data());
         let provider = CGDataProvider::with_cf_data(Some(&data));

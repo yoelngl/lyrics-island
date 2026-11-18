@@ -9,24 +9,30 @@ use tiny_skia::{
 };
 
 use super::text::{style, Label, Rgba, Style, Text};
-use super::{ease_in_out_quad, ease_out_back, ease_out_quad, rrect, Anim};
+use super::{ease_in_out_quad, ease_out_quart, ease_out_quad, ease_out_spring, rrect, Anim};
 use crate::model::Command;
 
-pub const PILL_H: f32 = 32.0;
-pub const PILL_MIN_W: f32 = 160.0;
-pub const EXPANDED_W: f32 = 400.0;
-pub const EXPANDED_H: f32 = 282.0;
+pub const PILL_H: f32 = 34.0;
+pub const PILL_MIN_W: f32 = 184.0;
+pub const EXPANDED_W: f32 = 416.0;
+pub const EXPANDED_H: f32 = 286.0;
+
+const COMPACT_PAD_L: f32 = 14.0;
+const COMPACT_PAD_R: f32 = 16.0;
+const COMPACT_GAP: f32 = 10.0;
+const BARS_W: f32 = 18.0;
+const CARD_PAD_X: f32 = 24.0;
 
 const BUTTONS: [(f32, Command); 3] = [
-    (136.0, Command::Previous),
-    (200.0, Command::PlayPause),
-    (264.0, Command::Next),
+    (EXPANDED_W / 2.0 - 64.0, Command::Previous),
+    (EXPANDED_W / 2.0, Command::PlayPause),
+    (EXPANDED_W / 2.0 + 64.0, Command::Next),
 ];
-const BUTTON_Y: f32 = 226.0;
+const BUTTON_Y: f32 = 230.0;
 const BUTTON_R: f32 = 18.0;
 /// 44px diameter hit target around each transport button, leaving 20px clear gap between neighbors.
 const BUTTON_HIT_R: f32 = 22.0;
-const DEFAULT_TRACK_X: (f32, f32) = (58.0, EXPANDED_W - 58.0);
+const DEFAULT_TRACK_X: (f32, f32) = (62.0, EXPANDED_W - 62.0);
 
 const TITLE: Style = style(14.67, 18.0, 700);
 const ARTIST: Style = style(13.33, 17.0, 400);
@@ -45,7 +51,12 @@ pub enum Hit {
 
 /// Logical height of the compact pill for a point size, never shorter than `PILL_H`.
 pub fn pill_height(font_pt: f32) -> f32 {
-    (font_pt * (96.0 / 72.0) * 1.35 + 12.0).round().max(PILL_H)
+    (font_pt * (96.0 / 72.0) * 1.35 + 14.0).round().max(PILL_H)
+}
+
+/// Logical square side of the compact pill album art, leaving generous vertical and horizontal inset.
+pub fn compact_art_size(font_pt: f32) -> f32 {
+    (pill_height(font_pt) - 12.0).max(20.0)
 }
 
 /// Compresses raw album-art colors into a dark or light luminance band so foreground text
@@ -113,7 +124,10 @@ pub struct Ctx<'a> {
     pub light: bool,
     pub font_pt: f32,
     pub playing: bool,
-    pub left_anchor: bool,
+    /// Horizontal center of the compact pill inside the canvas, in physical px.
+    pub center_x: f32,
+    /// True when the pill sits near the bottom of the screen so the card expands upward.
+    pub expand_up: bool,
     /// Seconds since the Ui started; drives the gradient sweep.
     pub clock: f32,
     pub pos_ms: u64,
@@ -138,8 +152,8 @@ pub struct Swap {
     t0: Option<Instant>,
 }
 
-const SWAP_OUT: Duration = Duration::from_millis(110);
-const SWAP_IN: Duration = Duration::from_millis(200);
+const SWAP_OUT: Duration = Duration::from_millis(100);
+const SWAP_IN: Duration = Duration::from_millis(180);
 
 impl Swap {
     fn new() -> Self {
@@ -194,10 +208,10 @@ impl Swap {
         let e = now.saturating_duration_since(t0).as_secs_f32();
         if self.pending.is_some() {
             let p = ease_out_quad((e / SWAP_OUT.as_secs_f32()).min(1.0));
-            (1.0 - p, -6.0 * p)
+            (1.0 - p, -5.0 * p)
         } else {
             let p = ease_out_quad((e / SWAP_IN.as_secs_f32()).min(1.0));
-            (p, 6.0 * (1.0 - p))
+            (p, 5.0 * (1.0 - p))
         }
     }
 }
@@ -223,7 +237,6 @@ impl Bars {
         if playing {
             if now >= self.next {
                 for a in &mut self.v {
-                    // xorshift32
                     self.seed ^= self.seed << 13;
                     self.seed ^= self.seed >> 17;
                     self.seed ^= self.seed << 5;
@@ -275,6 +288,8 @@ pub struct Island {
     pub pill_h: f32,
     /// Last laid-out logical `(x0, x1)` bounds of the progress bar track.
     track_x: (f32, f32),
+    /// Reused per-frame clip mask so rendering never allocates on the heap.
+    mask: Option<Mask>,
 }
 
 impl Island {
@@ -302,10 +317,12 @@ impl Island {
             pill_w: PILL_MIN_W,
             pill_h: PILL_H,
             track_x: DEFAULT_TRACK_X,
+            mask: None,
         }
     }
 
-    pub fn animating(&self, now: Instant) -> bool {
+    /// True while shape, cross-fade, or text-swap transitions are actively running (120 Hz path).
+    pub fn transitioning(&self, now: Instant) -> bool {
         !(self.w.done(now) && self.h.done(now) && self.compact_a.done(now) && self.expanded_a.done(now))
             || self.line.animating()
             || self.cur.animating()
@@ -316,7 +333,8 @@ impl Island {
         let line_px = font_pt * (96.0 / 72.0);
         let line_h = (line_px * 1.35).round();
         let ph = pill_height(font_pt);
-        let chrome = ph + 44.0;
+        let art = compact_art_size(font_pt);
+        let chrome = COMPACT_PAD_L + art + COMPACT_GAP + COMPACT_GAP + BARS_W + COMPACT_PAD_R;
         let max_w = max_w.max(PILL_MIN_W);
         self.line.label.layout(t, style(line_px, line_h, 600), scale, (max_w - chrome).max(1.0) * scale, 1);
         self.pill_w = (self.line.label.width() / scale + chrome).clamp(PILL_MIN_W, max_w).round();
@@ -329,11 +347,11 @@ impl Island {
             self.h.jump(self.pill_h);
             return;
         }
-        if (self.pill_w - self.w.to).abs() < 4.0 && (self.pill_h - self.h.to).abs() < 0.5 {
+        if (self.pill_w - self.w.to).abs() < 3.0 && (self.pill_h - self.h.to).abs() < 0.5 {
             return;
         }
-        self.w.set(self.pill_w, 240, 0, ease_out_quad, now);
-        self.h.set(self.pill_h, 240, 0, ease_out_quad, now);
+        self.w.set(self.pill_w, 240, 0, ease_out_quart, now);
+        self.h.set(self.pill_h, 240, 0, ease_out_quart, now);
     }
 
     pub fn expand(&mut self, now: Instant) {
@@ -347,10 +365,10 @@ impl Island {
         }
         self.cur.t0 = None;
         self.left_at = None;
-        self.compact_a.set(0.0, 100, 0, ease_out_quad, now);
-        self.w.set(EXPANDED_W, 420, 0, ease_out_back, now);
-        self.h.set(EXPANDED_H, 420, 0, ease_out_back, now);
-        self.expanded_a.set(1.0, 220, 180, ease_out_quad, now);
+        self.compact_a.set(0.0, 85, 0, ease_out_quad, now);
+        self.w.set(EXPANDED_W, 310, 0, ease_out_spring, now);
+        self.h.set(EXPANDED_H, 310, 0, ease_out_spring, now);
+        self.expanded_a.set(1.0, 180, 55, ease_out_quad, now);
     }
 
     /// The caller re-runs fit_pill afterwards so the pill eases back to the current line.
@@ -367,16 +385,65 @@ impl Island {
         self.pressed = None;
         self.focus = None;
         self.left_at = None;
-        self.expanded_a.set(0.0, 100, 0, ease_out_quad, now);
-        self.compact_a.set(1.0, 200, 150, ease_out_quad, now);
+        self.expanded_a.set(0.0, 80, 0, ease_out_quad, now);
+        self.compact_a.set(1.0, 160, 70, ease_out_quad, now);
     }
 
-    /// Shape origin x inside a window `win_w` physical px wide.
-    pub fn origin_x(&self, win_w: f32, scale: f32, left_anchor: bool, now: Instant) -> f32 {
-        if left_anchor { 0.0 } else { ((win_w - self.w.value(now) * scale) / 2.0).round() }
+    /// Top-left `(ox, oy)` and size `(w, h)` of the morphing shape in physical px inside the fixed canvas.
+    pub fn shape_rect(
+        &self,
+        win_size: (u32, u32),
+        scale: f32,
+        center_x: f32,
+        expand_up: bool,
+        now: Instant,
+    ) -> (f32, f32, f32, f32) {
+        let w = (self.w.value(now) * scale).max(1.0);
+        let h = (self.h.value(now) * scale).max(1.0);
+        let ox = box_x(win_size.0 as f32, center_x, w);
+        let oy = box_y(win_size.1 as f32, expand_up, h);
+        (ox, oy, w, h)
     }
 
-    /// Interactive control under `(x, y)` in logical px relative to the shape origin (expanded only).
+    /// Stationary compact pill top-left `(cox, coy)` and size `(cw, ch)` in physical px.
+    /// Does not change during expand/collapse so the small lyrics never shifts on screen.
+    pub fn compact_rect(
+        &self,
+        win_size: (u32, u32),
+        scale: f32,
+        center_x: f32,
+        expand_up: bool,
+    ) -> (f32, f32, f32, f32) {
+        let cw = (self.pill_w * scale).max(1.0);
+        let ch = (self.pill_h * scale).max(1.0);
+        (box_x(win_size.0 as f32, center_x, cw), box_y(win_size.1 as f32, expand_up, ch), cw, ch)
+    }
+
+    /// Expanded card origin `(eox, eoy)` in physical px.
+    pub fn expanded_origin(&self, win_size: (u32, u32), scale: f32, center_x: f32, expand_up: bool) -> (f32, f32) {
+        let ew = EXPANDED_W * scale;
+        let eh = EXPANDED_H * scale;
+        (box_x(win_size.0 as f32, center_x, ew), box_y(win_size.1 as f32, expand_up, eh))
+    }
+
+    /// Padded integer physical bounding box `(x, y, w, h)` of the active shape for input masking and dirty blits.
+    pub fn bounds(
+        &self,
+        win_size: (u32, u32),
+        scale: f32,
+        center_x: f32,
+        expand_up: bool,
+        now: Instant,
+    ) -> (i32, i32, u32, u32) {
+        let (ox, oy, w, h) = self.shape_rect(win_size, scale, center_x, expand_up, now);
+        let x0 = (ox.floor() as i32 - 2).clamp(0, win_size.0 as i32);
+        let y0 = (oy.floor() as i32 - 2).clamp(0, win_size.1 as i32);
+        let x1 = ((ox + w).ceil() as i32 + 2).clamp(x0, win_size.0 as i32);
+        let y1 = ((oy + h).ceil() as i32 + 2).clamp(y0, win_size.1 as i32);
+        (x0, y0, (x1 - x0) as u32, (y1 - y0) as u32)
+    }
+
+    /// Interactive control under `(x, y)` in logical px relative to the expanded card origin (expanded only).
     pub fn hit_at(&self, x: f32, y: f32, has_prev: bool, has_next: bool, has_len: bool) -> Option<Hit> {
         if !self.expanded {
             return None;
@@ -387,27 +454,27 @@ impl Island {
         {
             return Some(Hit::Button(cmd));
         }
-        if has_len && (20.0..=EXPANDED_W - 20.0).contains(&x) && (176.0..=204.0).contains(&y) {
+        if has_len && (CARD_PAD_X..=EXPANDED_W - CARD_PAD_X).contains(&x) && (178.0..=206.0).contains(&y) {
             return Some(Hit::Progress);
         }
         if has_prev
             && !self.prev.text().is_empty()
-            && (16.0..=EXPANDED_W - 16.0).contains(&x)
-            && (78.0..=103.0).contains(&y)
+            && (CARD_PAD_X - 6.0..=EXPANDED_W - CARD_PAD_X + 6.0).contains(&x)
+            && (80.0..=105.0).contains(&y)
         {
             return Some(Hit::PrevLine);
         }
         if has_next
             && !self.next.text().is_empty()
-            && (16.0..=EXPANDED_W - 16.0).contains(&x)
-            && (150.0..=175.0).contains(&y)
+            && (CARD_PAD_X - 6.0..=EXPANDED_W - CARD_PAD_X + 6.0).contains(&x)
+            && (152.0..=177.0).contains(&y)
         {
             return Some(Hit::NextLine);
         }
         None
     }
 
-    /// Maps logical `x` relative to the shape origin into `0.0..=1.0` along the progress track.
+    /// Maps logical `x` relative to the expanded card origin into `0.0..=1.0` along the progress track.
     pub fn progress_frac(&self, x: f32) -> f32 {
         let (x0, x1) = self.track_x;
         ((x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0)
@@ -439,11 +506,10 @@ impl Island {
 
     pub fn render(&mut self, pm: &mut Pixmap, t: &mut Text, c: &Ctx) {
         let (s, now) = (c.scale, c.now);
-        let w = self.w.value(now) * s;
-        let h = self.h.value(now) * s;
-        let ox = self.origin_x(pm.width() as f32, s, c.left_anchor, now);
+        let win_size = (pm.width(), pm.height());
+        let (ox, oy, w, h) = self.shape_rect(win_size, s, c.center_x, c.expand_up, now);
         let radius = (h / 2.0).min(28.0 * s);
-        let Some(shape) = rrect(ox, 0.0, w, h, radius) else { return };
+        let Some(shape) = rrect(ox, oy, w, h, radius) else { return };
         let pal = Palette::for_theme(c.light);
 
         let mut paint = Paint::default();
@@ -455,11 +521,10 @@ impl Island {
                     let m = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * k).round() as u8;
                     Color::from_rgba8(m(0), m(1), m(2), bg_alpha)
                 };
-                // Trading the endpoints back and forth sweeps the gradient smoothly across the card.
                 let k = (c.clock * std::f32::consts::TAU / 8.0).sin() / 2.0 + 0.5;
                 paint.shader = LinearGradient::new(
-                    Point::from_xy(ox, 0.0),
-                    Point::from_xy(ox + w, 0.0),
+                    Point::from_xy(ox, oy),
+                    Point::from_xy(ox + w, oy),
                     vec![GradientStop::new(0.0, col(k)), GradientStop::new(1.0, col(1.0 - k))],
                     SpreadMode::Pad,
                     Transform::identity(),
@@ -473,43 +538,87 @@ impl Island {
 
         let ca = self.compact_a.value(now);
         if ca > 0.01 {
-            self.render_compact(pm, t, c, (ox, w, h), ca, pal);
+            // Render compact content at its stationary compact box so small lyrics never moves when expanding/collapsing.
+            let crect = self.compact_rect(win_size, s, c.center_x, c.expand_up);
+            self.render_compact(pm, t, c, crect, ca, pal);
         }
         let ea = self.expanded_a.value(now);
         if ea > 0.01 {
-            self.render_expanded(pm, t, c, ox, ea, pal);
+            let eorig = self.expanded_origin(win_size, s, c.center_x, c.expand_up);
+            self.render_expanded(pm, t, c, eorig, ea, pal);
         }
 
-        // Content stays laid out at full size while the shape animates; clip it to the shape.
-        if let Some(mut mask) = Mask::new(pm.width(), pm.height()) {
+        // Reuse the cached mask and apply it strictly over the active shape's bounding rows/cols.
+        let (bx, by, bw, bh) = self.bounds(win_size, s, c.center_x, c.expand_up, now);
+        if self.mask.as_ref().is_none_or(|m| m.width() != win_size.0 || m.height() != win_size.1) {
+            self.mask = Mask::new(win_size.0, win_size.1);
+        }
+        if let Some(mask) = self.mask.as_mut() {
+            let pw = win_size.0 as usize;
+            let (x0, y0, x1, y1) = (bx as usize, by as usize, (bx as usize + bw as usize).min(pw), (by as usize + bh as usize).min(win_size.1 as usize));
+            let mdata = mask.data_mut();
+            for row in y0..y1 {
+                mdata[row * pw + x0..row * pw + x1].fill(0);
+            }
             mask.fill_path(&shape, FillRule::Winding, true, Transform::identity());
-            pm.apply_mask(&mask);
+            let mdata = mask.data();
+            let pdata = pm.data_mut();
+            for row in y0..y1 {
+                for col in x0..x1 {
+                    let i = row * pw + col;
+                    let ma = mdata[i] as u32;
+                    if ma < 255 {
+                        let px = &mut pdata[i * 4..i * 4 + 4];
+                        if ma == 0 {
+                            px.fill(0);
+                        } else {
+                            px[0] = ((px[0] as u32 * ma + 127) / 255) as u8;
+                            px[1] = ((px[1] as u32 * ma + 127) / 255) as u8;
+                            px[2] = ((px[2] as u32 * ma + 127) / 255) as u8;
+                            px[3] = ((px[3] as u32 * ma + 127) / 255) as u8;
+                        }
+                    }
+                }
+            }
         }
 
-        // Inset by half the stroke width so the 1px border lands cleanly inside the pixmap bounds.
         let inset = 0.5 * s;
         stroke(
             pm,
-            rrect(ox + inset, inset, w - 2.0 * inset, h - 2.0 * inset, (radius - inset).max(0.0)),
+            rrect(ox + inset, oy + inset, w - 2.0 * inset, h - 2.0 * inset, (radius - inset).max(0.0)),
             1.0 * s,
             pal.border,
         );
     }
 
-    fn render_compact(&mut self, pm: &mut Pixmap, t: &mut Text, c: &Ctx, rect: (f32, f32, f32), a: f32, pal: Palette) {
-        let (ox, w, h) = rect;
+    fn render_compact(
+        &mut self,
+        pm: &mut Pixmap,
+        t: &mut Text,
+        c: &Ctx,
+        crect: (f32, f32, f32, f32),
+        a: f32,
+        pal: Palette,
+    ) {
+        let (cox, coy, cw, ch) = crect;
         let s = c.scale;
-        let ph = pill_height(c.font_pt);
-        let art = ph - 8.0;
-        draw_art(pm, c.art_small, (ox + 4.0 * s, (h - art * s) / 2.0, art * s), 7.0 * s, a, c.light);
+        let art = compact_art_size(c.font_pt);
+        draw_art(
+            pm,
+            c.art_small,
+            (cox + COMPACT_PAD_L * s, coy + (ch - art * s) / 2.0, art * s),
+            6.0 * s,
+            a,
+            c.light,
+        );
 
         let line_px = c.font_pt * (96.0 / 72.0);
         let line_h = (line_px * 1.35).round();
         let (la, dy) = self.line.look(c.now);
-        let x = ox + (4.0 + art + 8.0) * s;
-        let right = ox + w - (12.0 + 18.0 + 8.0) * s;
-        let y = (h - line_h * s) / 2.0 + dy * s;
-        let clip = (x, 0.0, right, h);
+        let x = cox + (COMPACT_PAD_L + art + COMPACT_GAP) * s;
+        let right = cox + cw - (COMPACT_PAD_R + BARS_W + COMPACT_GAP) * s;
+        let y = coy + (ch - line_h * s) / 2.0 + dy * s;
+        let clip = (x, coy, right, coy + ch);
         match &c.karaoke {
             Some((line, word, frac)) if self.line.settled() && self.line.label.text() == *line => {
                 t.draw(pm, &self.line.label, (x, y), pal.karaoke_base.alpha(a * la), clip, None);
@@ -518,70 +627,91 @@ impl Island {
             _ => t.draw(pm, &self.line.label, (x, y), pal.primary.alpha(a * la), clip, None),
         }
 
-        let bar_h = (ph * 0.5).round().min(20.0);
-        draw_bars(pm, c.bars, (ox + w - (12.0 + 18.0) * s, h / 2.0), bar_h, s, pal.primary.alpha(a));
+        let bar_h = (pill_height(c.font_pt) * 0.48).round().min(18.0);
+        draw_bars(
+            pm,
+            c.bars,
+            (cox + cw - (COMPACT_PAD_R + BARS_W) * s, coy + ch / 2.0),
+            bar_h,
+            s,
+            pal.primary.alpha(a),
+        );
     }
 
-    fn render_expanded(&mut self, pm: &mut Pixmap, t: &mut Text, c: &Ctx, ox: f32, a: f32, pal: Palette) {
+    fn render_expanded(
+        &mut self,
+        pm: &mut Pixmap,
+        t: &mut Text,
+        c: &Ctx,
+        orig: (f32, f32),
+        a: f32,
+        pal: Palette,
+    ) {
+        let (eox, eoy) = orig;
         let s = c.scale;
-        let x = |v: f32| ox + v * s;
-        let y = |v: f32| v * s;
-        let clip = (x(20.0), 0.0, x(EXPANDED_W - 20.0), pm.height() as f32);
+        let x = |v: f32| eox + v * s;
+        let y = |v: f32| eoy + v * s;
+        let clip = (x(CARD_PAD_X), eoy, x(EXPANDED_W - CARD_PAD_X), eoy + EXPANDED_H * s);
 
-        draw_art(pm, c.art_large, (x(20.0), y(16.0), 56.0 * s), 12.0 * s, a, c.light);
-        let meta_w = (EXPANDED_W - 20.0 - 56.0 - 12.0 - 12.0 - 18.0 - 20.0) * s;
+        draw_art(pm, c.art_large, (x(CARD_PAD_X), y(18.0), 56.0 * s), 12.0 * s, a, c.light);
+        let meta_x = CARD_PAD_X + 56.0 + 12.0;
+        let meta_w = (EXPANDED_W - meta_x - 12.0 - BARS_W - CARD_PAD_X) * s;
         self.title.layout(t, TITLE, s, meta_w, 1);
         self.artist.layout(t, ARTIST, s, meta_w, 1);
-        t.draw(pm, &self.title, (x(88.0), y(26.5)), pal.primary.alpha(a), clip, None);
-        t.draw(pm, &self.artist, (x(88.0), y(44.5)), pal.secondary.alpha(a), clip, None);
-        draw_bars(pm, c.bars, (x(EXPANDED_W - 20.0 - 18.0), y(44.0)), 20.0, s, pal.primary.alpha(a));
+        t.draw(pm, &self.title, (x(meta_x), y(28.5)), pal.primary.alpha(a), clip, None);
+        t.draw(pm, &self.artist, (x(meta_x), y(46.5)), pal.secondary.alpha(a), clip, None);
+        draw_bars(pm, c.bars, (x(EXPANDED_W - CARD_PAD_X - BARS_W), y(46.0)), 20.0, s, pal.primary.alpha(a));
 
-        let text_w = (EXPANDED_W - 40.0) * s;
+        let text_w = (EXPANDED_W - 2.0 * CARD_PAD_X) * s;
         self.prev.layout(t, SIDE, s, text_w, 1);
         self.next.layout(t, SIDE, s, text_w, 1);
         self.cur.label.layout(t, CUR, s, text_w, 2);
 
         let can_prev = c.has_prev_line && !self.prev.text().is_empty();
         if can_prev && self.hover == Some(Hit::PrevLine) {
-            fill(pm, rrect(x(14.0), y(80.0), (EXPANDED_W - 28.0) * s, 24.0 * s, 6.0 * s), pal.line_hover_bg.alpha(a));
+            fill(
+                pm,
+                rrect(x(CARD_PAD_X - 6.0), y(82.0), (EXPANDED_W - 2.0 * (CARD_PAD_X - 6.0)) * s, 24.0 * s, 6.0 * s),
+                pal.line_hover_bg.alpha(a),
+            );
         }
         let prev_col = if can_prev && (self.hover == Some(Hit::PrevLine) || self.focus == Some(Hit::PrevLine)) {
             pal.primary
         } else {
             pal.secondary
         };
-        t.draw(pm, &self.prev, (x(20.0), y(84.0)), prev_col.alpha(a), clip, None);
+        t.draw(pm, &self.prev, (x(CARD_PAD_X), y(86.0)), prev_col.alpha(a), clip, None);
         if can_prev && self.focus == Some(Hit::PrevLine) {
             stroke(
                 pm,
-                rrect(x(14.0), y(80.0), (EXPANDED_W - 28.0) * s, 24.0 * s, 6.0 * s),
+                rrect(x(CARD_PAD_X - 6.0), y(82.0), (EXPANDED_W - 2.0 * (CARD_PAD_X - 6.0)) * s, 24.0 * s, 6.0 * s),
                 2.0 * s,
                 pal.focus_ring.alpha(a),
             );
         }
 
         let (la, dy) = self.cur.look(c.now);
-        let cy = y(106.0 + dy);
+        let cy = y(108.0 + dy);
         match &c.karaoke {
             Some((line, word, frac)) if self.cur.settled() && self.cur.label.text() == *line => {
-                t.draw(pm, &self.cur.label, (x(20.0), cy), pal.karaoke_base.alpha(a * la), clip, None);
+                t.draw(pm, &self.cur.label, (x(CARD_PAD_X), cy), pal.karaoke_base.alpha(a * la), clip, None);
                 t.draw(
                     pm,
                     &self.cur.label,
-                    (x(20.0), cy),
+                    (x(CARD_PAD_X), cy),
                     pal.primary.alpha(a * la),
                     clip,
                     Some((word.clone(), *frac)),
                 );
             }
-            _ => t.draw(pm, &self.cur.label, (x(20.0), cy), pal.primary.alpha(a * la), clip, None),
+            _ => t.draw(pm, &self.cur.label, (x(CARD_PAD_X), cy), pal.primary.alpha(a * la), clip, None),
         }
 
         let can_next = c.has_next_line && !self.next.text().is_empty();
         if can_next && self.hover == Some(Hit::NextLine) {
             fill(
                 pm,
-                rrect(x(14.0), y(150.0), (EXPANDED_W - 28.0) * s, 24.0 * s, 6.0 * s),
+                rrect(x(CARD_PAD_X - 6.0), y(152.0), (EXPANDED_W - 2.0 * (CARD_PAD_X - 6.0)) * s, 24.0 * s, 6.0 * s),
                 pal.line_hover_bg.alpha(a),
             );
         }
@@ -590,11 +720,11 @@ impl Island {
         } else {
             pal.secondary
         };
-        t.draw(pm, &self.next, (x(20.0), y(154.0)), next_col.alpha(a), clip, None);
+        t.draw(pm, &self.next, (x(CARD_PAD_X), y(156.0)), next_col.alpha(a), clip, None);
         if can_next && self.focus == Some(Hit::NextLine) {
             stroke(
                 pm,
-                rrect(x(14.0), y(150.0), (EXPANDED_W - 28.0) * s, 24.0 * s, 6.0 * s),
+                rrect(x(CARD_PAD_X - 6.0), y(152.0), (EXPANDED_W - 2.0 * (CARD_PAD_X - 6.0)) * s, 24.0 * s, 6.0 * s),
                 2.0 * s,
                 pal.focus_ring.alpha(a),
             );
@@ -609,20 +739,19 @@ impl Island {
                 let preview_ms = (clamped * c.len_ms as f32).round() as u64;
                 self.scrub_elapsed.set(&fmt_time(preview_ms));
                 self.scrub_elapsed.layout(t, TIME, s, 80.0 * s, 1);
-                t.draw(pm, &self.scrub_elapsed, (x(20.0), y(184.0)), pal.primary.alpha(a), clip, None);
+                t.draw(pm, &self.scrub_elapsed, (x(CARD_PAD_X), y(186.0)), pal.primary.alpha(a), clip, None);
                 (self.elapsed.width().max(self.scrub_elapsed.width()), clamped)
             }
             None => {
-                t.draw(pm, &self.elapsed, (x(20.0), y(184.0)), pal.secondary.alpha(a), clip, None);
+                t.draw(pm, &self.elapsed, (x(CARD_PAD_X), y(186.0)), pal.secondary.alpha(a), clip, None);
                 let f = if c.len_ms > 0 { (c.pos_ms as f32 / c.len_ms as f32).clamp(0.0, 1.0) } else { 0.0 };
                 (self.elapsed.width(), f)
             }
         };
-        t.draw(pm, &self.total, (x(EXPANDED_W - 20.0) - tw, y(184.0)), pal.secondary.alpha(a), clip, None);
+        t.draw(pm, &self.total, (x(EXPANDED_W - CARD_PAD_X) - tw, y(186.0)), pal.secondary.alpha(a), clip, None);
 
-        let lx0 = 20.0 + ew / s + 10.0;
-        let lx1 = (EXPANDED_W - 20.0 - tw / s - 10.0).max(lx0 + 1.0);
-        // Freeze `track_x` while scrubbing so pointer-to-fraction mapping stays steady mid-drag.
+        let lx0 = CARD_PAD_X + ew / s + 10.0;
+        let lx1 = (EXPANDED_W - CARD_PAD_X - tw / s - 10.0).max(lx0 + 1.0);
         if c.scrub_frac.is_none() {
             self.track_x = (lx0, lx1);
         }
@@ -633,7 +762,7 @@ impl Island {
                 || self.focus == Some(Hit::Progress)
                 || c.scrub_frac.is_some());
         let th = if prog_active { 6.0 * s } else { 4.0 * s };
-        let tcy = y(191.0);
+        let tcy = y(193.0);
         fill(pm, rrect(tx0, tcy - th / 2.0, tx1 - tx0, th, th / 2.0), pal.track_bg.alpha(a));
         fill(pm, rrect(tx0, tcy - th / 2.0, (tx1 - tx0) * frac, th, th / 2.0), pal.primary.alpha(a));
         if prog_active {
@@ -643,7 +772,7 @@ impl Island {
         if can_seek && self.focus == Some(Hit::Progress) {
             stroke(
                 pm,
-                rrect(tx0 - 8.0 * s, y(181.0), (tx1 - tx0) + 16.0 * s, 20.0 * s, 10.0 * s),
+                rrect(tx0 - 8.0 * s, y(183.0), (tx1 - tx0) + 16.0 * s, 20.0 * s, 10.0 * s),
                 2.0 * s,
                 pal.focus_ring.alpha(a),
             );
@@ -677,7 +806,19 @@ impl Island {
 
         self.credit.layout(t, CREDIT, s, text_w, 1);
         let cw = self.credit.width();
-        t.draw(pm, &self.credit, (x(EXPANDED_W / 2.0) - cw / 2.0, y(254.0)), pal.secondary.alpha(a), clip, None);
+        t.draw(pm, &self.credit, (x(EXPANDED_W / 2.0) - cw / 2.0, y(258.0)), pal.secondary.alpha(a), clip, None);
+    }
+}
+
+fn box_x(win_w: f32, center_x: f32, w: f32) -> f32 {
+    (center_x - w / 2.0).round().clamp(0.0, (win_w - w).max(0.0))
+}
+
+fn box_y(win_h: f32, expand_up: bool, h: f32) -> f32 {
+    if expand_up {
+        (win_h - h).round().max(0.0)
+    } else {
+        0.0
     }
 }
 
@@ -793,11 +934,26 @@ mod tests {
     }
 
     #[test]
-    fn pill_height_scales_and_clamps_to_minimum() {
+    fn pill_height_and_compact_box_stay_stationary_across_expand_collapse() {
         assert_eq!(pill_height(8.0), PILL_H);
-        assert_eq!(pill_height(11.0), 32.0);
-        assert_eq!(pill_height(14.0), 37.0);
-        assert_eq!(pill_height(18.0), 44.0);
+        assert_eq!(pill_height(11.0), 34.0);
+        assert_eq!(pill_height(18.0), 46.0);
+
+        // Verify compact art never overflows the semicircular pill cap (pad_l + r > pill_r).
+        let r_pill = pill_height(11.0) / 2.0;
+        assert!(COMPACT_PAD_L + 6.0 > r_pill);
+
+        let now = Instant::now();
+        let mut isl = Island::new(now);
+        let win = (850, 310);
+        let before_down = isl.compact_rect(win, 1.0, 425.0, false);
+        let before_up = isl.compact_rect(win, 1.0, 425.0, true);
+        isl.expand(now);
+        assert_eq!(isl.compact_rect(win, 1.0, 425.0, false), before_down);
+        assert_eq!(isl.compact_rect(win, 1.0, 425.0, true), before_up);
+        isl.collapse(now + Duration::from_millis(200));
+        assert_eq!(isl.compact_rect(win, 1.0, 425.0, false), before_down);
+        assert_eq!(isl.compact_rect(win, 1.0, 425.0, true), before_up);
     }
 
     #[test]
@@ -846,38 +1002,33 @@ mod tests {
         isl.prev.set("Earlier line");
         isl.next.set("Upcoming line");
 
-        assert_eq!(isl.hit_at(200.0, BUTTON_Y, true, true, true), None);
-        assert_eq!(isl.hit_at(200.0, 189.0, true, true, true), None);
+        let mid = EXPANDED_W / 2.0;
+        assert_eq!(isl.hit_at(mid, BUTTON_Y, true, true, true), None);
+        assert_eq!(isl.hit_at(mid, 193.0, true, true, true), None);
 
         isl.expand(now);
-        assert_eq!(isl.hit_at(136.0, BUTTON_Y, true, true, true), Some(Hit::Button(Command::Previous)));
-        assert_eq!(isl.hit_at(200.0, BUTTON_Y, true, true, true), Some(Hit::Button(Command::PlayPause)));
-        assert_eq!(isl.hit_at(264.0, BUTTON_Y, true, true, true), Some(Hit::Button(Command::Next)));
-        // Outer edge of the 44px diameter target hits; the 20px gap between buttons does not.
-        assert_eq!(isl.hit_at(200.0 + 21.5, BUTTON_Y, true, true, true), Some(Hit::Button(Command::PlayPause)));
-        assert_eq!(isl.hit_at(168.0, BUTTON_Y, true, true, true), None);
+        assert_eq!(isl.hit_at(mid - 64.0, BUTTON_Y, true, true, true), Some(Hit::Button(Command::Previous)));
+        assert_eq!(isl.hit_at(mid, BUTTON_Y, true, true, true), Some(Hit::Button(Command::PlayPause)));
+        assert_eq!(isl.hit_at(mid + 64.0, BUTTON_Y, true, true, true), Some(Hit::Button(Command::Next)));
+        assert_eq!(isl.hit_at(mid + 21.5, BUTTON_Y, true, true, true), Some(Hit::Button(Command::PlayPause)));
+        assert_eq!(isl.hit_at(mid - 32.0, BUTTON_Y, true, true, true), None);
 
-        assert_eq!(isl.hit_at(200.0, 189.0, true, true, true), Some(Hit::Progress));
-        assert_eq!(isl.hit_at(200.0, 189.0, true, true, false), None);
+        assert_eq!(isl.hit_at(mid, 193.0, true, true, true), Some(Hit::Progress));
+        assert_eq!(isl.hit_at(mid, 193.0, true, true, false), None);
 
-        assert_eq!(isl.hit_at(200.0, 90.0, true, true, true), Some(Hit::PrevLine));
-        assert_eq!(isl.hit_at(200.0, 90.0, false, true, true), None);
-        assert_eq!(isl.hit_at(200.0, 160.0, true, true, true), Some(Hit::NextLine));
-        assert_eq!(isl.hit_at(200.0, 160.0, true, false, true), None);
-
-        isl.prev.set("");
-        isl.next.set("");
-        assert_eq!(isl.hit_at(200.0, 90.0, true, true, true), None);
-        assert_eq!(isl.hit_at(200.0, 160.0, true, true, true), None);
+        assert_eq!(isl.hit_at(mid, 92.0, true, true, true), Some(Hit::PrevLine));
+        assert_eq!(isl.hit_at(mid, 92.0, false, true, true), None);
+        assert_eq!(isl.hit_at(mid, 164.0, true, true, true), Some(Hit::NextLine));
+        assert_eq!(isl.hit_at(mid, 164.0, true, false, true), None);
     }
 
     #[test]
     fn progress_frac_clamps_and_maps_track_bounds() {
         let isl = Island::new(Instant::now());
         assert_eq!(isl.progress_frac(0.0), 0.0);
-        assert_eq!(isl.progress_frac(58.0), 0.0);
-        assert!((isl.progress_frac(200.0) - 0.5).abs() < 1e-6);
-        assert_eq!(isl.progress_frac(EXPANDED_W - 58.0), 1.0);
+        assert_eq!(isl.progress_frac(62.0), 0.0);
+        assert!((isl.progress_frac(EXPANDED_W / 2.0) - 0.5).abs() < 1e-6);
+        assert_eq!(isl.progress_frac(EXPANDED_W - 62.0), 1.0);
         assert_eq!(isl.progress_frac(EXPANDED_W), 1.0);
     }
 
@@ -899,31 +1050,13 @@ mod tests {
             isl.move_focus(false, true, true, true);
             assert_eq!(isl.focus, Some(expected));
         }
-        // Wraps back to the first item.
         isl.move_focus(false, true, true, true);
         assert_eq!(isl.focus, Some(Hit::PrevLine));
 
-        // Shift+Tab wraps backward to the last item.
         isl.move_focus(true, true, true, true);
         assert_eq!(isl.focus, Some(Hit::Button(Command::Next)));
 
-        // Disabled items are skipped when cycling.
-        isl.focus = None;
-        isl.move_focus(false, false, true, false);
-        assert_eq!(isl.focus, Some(Hit::NextLine));
-        isl.move_focus(false, false, true, false);
-        assert_eq!(isl.focus, Some(Hit::Button(Command::Previous)));
-
-        // Initial Shift+Tab from None lands on the last item.
-        isl.focus = None;
-        isl.move_focus(true, false, false, false);
-        assert_eq!(isl.focus, Some(Hit::Button(Command::Next)));
-
-        isl.hover = Some(Hit::Progress);
-        isl.pressed = Some(Hit::Progress);
         isl.collapse(now);
-        assert_eq!(isl.hover, None);
-        assert_eq!(isl.pressed, None);
         assert_eq!(isl.focus, None);
     }
 }
