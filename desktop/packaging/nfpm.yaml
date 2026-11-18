@@ -1,0 +1,31 @@
+# deb, rpm and Arch packages from one spec; run from desktop/ with VERSION set (see .github/workflows/desktop.yml).
+name: lyrics-island
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: sound
+priority: optional
+maintainer: Lyrics Island Contributors <yoelmarket123@gmail.com>
+description: Dynamic Island-style synced lyrics overlay
+homepage: https://github.com/yoelngl/lyrics-island
+license: GPL-2.0-or-later
+contents:
+  - src: target/release/lyrics-island
+    dst: /usr/bin/lyrics-island
+    file_info:
+      mode: 0755
+  - src: packaging/lyrics-island.desktop
+    dst: /usr/share/applications/lyrics-island.desktop
+    file_info:
+      mode: 0644
+  - src: packaging/lyrics-island.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/lyrics-island.svg
+    file_info:
+      mode: 0644
+overrides:
+  deb:
+    depends: ["libc6", "libssl3 | libssl3t64"]
+  rpm:
+    depends: ["libssl.so.3()(64bit)"]
+  archlinux:
+    depends: ["openssl"]

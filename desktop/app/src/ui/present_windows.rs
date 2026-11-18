@@ -71,7 +71,7 @@ impl Presenter {
                 self.size = (w, h);
             }
             let dst = std::slice::from_raw_parts_mut(self.bits, (w * h * 4) as usize);
-            for (d, s) in dst.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(pm.data().as_chunks::<4>().0) {
                 d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
             }
             let size = SIZE { cx: w as i32, cy: h as i32 };

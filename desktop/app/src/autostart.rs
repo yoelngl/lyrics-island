@@ -1,8 +1,12 @@
 //! Launch-at-login registration per OS: XDG autostart (.desktop), macOS LaunchAgents (.plist), Windows Run key.
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::fs;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use std::path::PathBuf;
 
 pub fn is_enabled() -> bool {
     #[cfg(target_os = "linux")]

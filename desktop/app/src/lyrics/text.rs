@@ -168,14 +168,14 @@ fn has_noise_word(c: &[u8]) -> bool {
                 if at(k, b"video") || at(k, b"audio") {
                     ends.push(k + 5);
                 }
-                if let Some(n) = Some(k + 5).filter(|_| at(k, b"music")).and_then(after_ws) {
+                if let Some(n) = at(k, b"music").then_some(k + 5).and_then(after_ws) {
                     if at(n, b"video") {
                         ends.push(n + 5);
                     }
                 }
             }
         }
-        if let Some(k) = Some(i + 4).filter(|_| at(i, b"live")).and_then(after_ws) {
+        if let Some(k) = at(i, b"live").then_some(i + 4).and_then(after_ws) {
             if at(k, b"version") {
                 ends.push(k + 7);
             }

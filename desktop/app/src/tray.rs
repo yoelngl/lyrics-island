@@ -10,6 +10,7 @@ use crate::{Action, AppEvent};
 pub struct Tray {
     _icon: TrayIcon,
     island: CheckMenuItem,
+    lock: CheckMenuItem,
     desktop: CheckMenuItem,
     click_through: CheckMenuItem,
     karaoke: CheckMenuItem,
@@ -34,6 +35,7 @@ fn action(id: &str) -> Option<Action> {
     Some(match id {
         "settings" => Action::OpenSettings,
         "island" => Action::ToggleIsland,
+        "lock" => Action::ToggleLock,
         "desktop" => Action::ToggleDesktop,
         "click-through" => Action::ToggleClickThrough,
         "karaoke" => Action::ToggleKaraoke,
@@ -61,6 +63,7 @@ impl Tray {
     ) -> Option<Tray> {
         let settings = MenuItem::with_id("settings", "Settings...", true, None);
         let island = CheckMenuItem::with_id("island", "Show island", true, cfg.island_visible, None);
+        let lock = CheckMenuItem::with_id("lock", "Lock island position", true, cfg.island_locked, None);
         let desktop = CheckMenuItem::with_id("desktop", "Desktop lyrics", true, cfg.desktop_visible, None);
         let click_through =
             CheckMenuItem::with_id("click-through", "Click-through", true, cfg.click_through, None);
@@ -116,6 +119,7 @@ impl Tray {
             &settings,
             &PredefinedMenuItem::separator(),
             &island,
+            &lock,
             &desktop,
             &click_through,
             &karaoke,
@@ -149,6 +153,7 @@ impl Tray {
         Some(Tray {
             _icon: icon,
             island,
+            lock,
             desktop,
             click_through,
             karaoke,
@@ -166,6 +171,7 @@ impl Tray {
     /// Native menus may have toggled a check on click already; always mirror the config.
     pub fn sync(&self, cfg: &UiConfig, autostart: bool, preferred_player: Option<&str>) {
         self.island.set_checked(cfg.island_visible);
+        self.lock.set_checked(cfg.island_locked);
         self.desktop.set_checked(cfg.desktop_visible);
         self.click_through.set_checked(cfg.click_through);
         self.karaoke.set_checked(cfg.karaoke);
@@ -242,6 +248,7 @@ mod tests {
     fn menu_ids_map_to_actions() {
         assert_eq!(action("settings"), Some(Action::OpenSettings));
         assert_eq!(action("island"), Some(Action::ToggleIsland));
+        assert_eq!(action("lock"), Some(Action::ToggleLock));
         assert_eq!(action("desktop"), Some(Action::ToggleDesktop));
         assert_eq!(action("click-through"), Some(Action::ToggleClickThrough));
         assert_eq!(action("karaoke"), Some(Action::ToggleKaraoke));

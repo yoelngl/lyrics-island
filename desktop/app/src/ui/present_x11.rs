@@ -209,7 +209,7 @@ impl X11Presenter {
         self.buf.reserve(dw * dh * 4);
         for row in dy..dy + dh {
             let row_slice = &src[(row * pw + dx) * 4..(row * pw + dx + dw) * 4];
-            for p in row_slice.chunks_exact(4) {
+            for p in row_slice.as_chunks::<4>().0 {
                 let px = if msb { [p[3], p[0], p[1], p[2]] } else { [p[2], p[1], p[0], p[3]] };
                 self.buf.extend_from_slice(&px);
             }
@@ -417,7 +417,7 @@ impl WaylandPresenter {
         for row in dy..dy + dh {
             let s_row = &src[(row * pw + dx) * 4..(row * pw + dx + dw) * 4];
             let d_row = &mut slot.mmap[(row * pw + dx) * 4..(row * pw + dx + dw) * 4];
-            for (dst, s) in d_row.chunks_exact_mut(4).zip(s_row.chunks_exact(4)) {
+            for (dst, s) in d_row.as_chunks_mut::<4>().0.iter_mut().zip(s_row.as_chunks::<4>().0) {
                 dst.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
             }
         }

@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::{Action, AppEvent};
+use crate::AppEvent;
+#[cfg(unix)]
+use crate::Action;
 
 pub struct InstanceGuard {
     #[cfg(unix)]

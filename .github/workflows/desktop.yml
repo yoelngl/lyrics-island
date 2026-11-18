@@ -2,6 +2,9 @@ name: Desktop app
 
 on:
   push:
+    branches: ["**"]
+    # Path filters are not evaluated for tag pushes, so every v* tag builds and publishes a release.
+    tags: ["v*"]
     paths: ["desktop/**", ".github/workflows/desktop.yml"]
   pull_request:
     paths: ["desktop/**", ".github/workflows/desktop.yml"]
@@ -11,7 +14,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # 22.04's glibc 2.35 keeps the Linux binary runnable on Debian 12 and other older distros.
+        os: [ubuntu-22.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -38,6 +42,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --release --workspace
 
+      - name: Version
+        run: echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' app/Cargo.toml | head -n1)" >> "$GITHUB_ENV"
+
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
@@ -55,43 +62,26 @@ jobs:
             lyrics-island install.sh packaging/lyrics-island.desktop packaging/lyrics-island.svg
           rm -rf "$stage_tar"
 
-          stage_deb=$(mktemp -d)
-          chmod 0755 "$stage_deb"
-          mkdir -p \
-            "$stage_deb/DEBIAN" \
-            "$stage_deb/usr/bin" \
-            "$stage_deb/usr/share/applications" \
-            "$stage_deb/usr/share/icons/hicolor/scalable/apps"
-          chmod 0755 \
-            "$stage_deb/DEBIAN" \
-            "$stage_deb/usr" \
-            "$stage_deb/usr/bin" \
-            "$stage_deb/usr/share" \
-            "$stage_deb/usr/share/applications" \
-            "$stage_deb/usr/share/icons" \
-            "$stage_deb/usr/share/icons/hicolor" \
-            "$stage_deb/usr/share/icons/hicolor/scalable" \
-            "$stage_deb/usr/share/icons/hicolor/scalable/apps"
-          install -m 0755 target/release/lyrics-island "$stage_deb/usr/bin/lyrics-island"
-          install -m 0644 packaging/lyrics-island.desktop "$stage_deb/usr/share/applications/lyrics-island.desktop"
-          install -m 0644 packaging/lyrics-island.svg "$stage_deb/usr/share/icons/hicolor/scalable/apps/lyrics-island.svg"
-          printf '%s\n' \
-            'Package: lyrics-island' \
-            'Version: 0.1.0' \
-            'Section: sound' \
-            'Priority: optional' \
-            'Architecture: amd64' \
-            'Depends: libc6, libssl3 | libssl1.1, libx11-6, libxcb1' \
-            'Maintainer: Lyrics Island Contributors' \
-            'Description: Dynamic Island-style synced lyrics overlay' \
-            > "$stage_deb/DEBIAN/control"
-          chmod 0644 "$stage_deb/DEBIAN/control"
-          dpkg-deb --root-owner-group --build "$stage_deb" dist/lyrics-island_0.1.0_amd64.deb
-          rm -rf "$stage_deb"
+          curl -fsSL https://github.com/goreleaser/nfpm/releases/download/v2.49.0/nfpm_2.49.0_Linux_x86_64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP" nfpm
+          for p in deb rpm archlinux; do
+            "$RUNNER_TEMP/nfpm" package --config packaging/nfpm.yaml --packager "$p" --target dist/
+          done
+
+          appdir="$RUNNER_TEMP/AppDir"
+          mkdir -p "$appdir/usr/bin"
+          install -m 0755 target/release/lyrics-island "$appdir/usr/bin/lyrics-island"
+          install -m 0644 packaging/lyrics-island.desktop packaging/lyrics-island.svg "$appdir/"
+          ln -s usr/bin/lyrics-island "$appdir/AppRun"
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          ARCH=x86_64 "$RUNNER_TEMP/appimagetool" --appimage-extract-and-run "$appdir" \
+            "dist/Lyrics_Island-$VERSION-x86_64.AppImage"
 
       - name: Package Windows
         if: runner.os == 'Windows'
-        run: mkdir dist && cp target/release/lyrics-island.exe dist/
+        run: mkdir dist && cp target/release/lyrics-island.exe "dist/lyrics-island-$VERSION-windows-x86_64.exe"
 
       - name: Package macOS
         if: runner.os == 'macOS'
@@ -100,7 +90,7 @@ jobs:
           mkdir -p "$app/MacOS" "$app/Frameworks"
           cp target/release/lyrics-island "$app/MacOS/"
           cp target/release/libmr_helper.dylib "$app/Frameworks/"
-          cat > "$app/Info.plist" <<'EOF'
+          cat > "$app/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -109,7 +99,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>dev.blog.lyrics-island</string>
             <key>CFBundleExecutable</key><string>lyrics-island</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>LSUIElement</key><true/>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
             <key>NSAppleEventsUsageDescription</key><string>Reads the current track from Spotify and Music.</string>
@@ -117,9 +107,29 @@ jobs:
           </plist>
           EOF
           codesign --force --deep --sign - "dist/Lyrics Island.app"
-          cd dist && ditto -c -k --keepParent "Lyrics Island.app" "Lyrics Island.app.zip" && rm -rf "Lyrics Island.app"
+          stage=$(mktemp -d)
+          mv "dist/Lyrics Island.app" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname "Lyrics Island" -srcfolder "$stage" -ov -format UDZO \
+            "dist/Lyrics-Island-$VERSION-macos-$(uname -m).dmg"
 
       - uses: actions/upload-artifact@v4
         with:
           name: lyrics-island-${{ runner.os }}
           path: desktop/dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

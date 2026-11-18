@@ -2,27 +2,31 @@
 
 A small native app for Windows, macOS and Linux that shows time-synced lyrics for whatever is playing. It ports the GNOME Shell extension in the repository root to a floating window:
 
-- **Island:** a pill showing the current line, configurable in maximum width and font size. Click it to expand: album art, title, artist, the previous, current and next lines, a progress bar, previous/play/next buttons and the lyrics source. Click or drag the progress bar to seek, or click the previous or next lyric line to jump to it. While expanded, `Tab` moves focus, `Enter` or `Space` activates the focused control, `Left` and `Right` seek backward or forward, and `Escape` collapses the card. Clicking elsewhere also collapses it.
+- **Island:** a pill showing the current line, configurable in maximum width and font size. Click it to expand: album art, title, artist, the previous, current and next lines, a progress bar, previous/play/next buttons, a gear that opens Settings, and the lyrics source. The card grows away from the nearest screen edge: to the right when the pill is in the left third of the screen, to the left in the right third, and both ways in the middle (upward near the bottom). Click or drag the progress bar to seek, or click the previous or next lyric line to jump to it. While expanded, `Tab` moves focus, `Enter` or `Space` activates the focused control, `Left` and `Right` seek backward or forward, and `Escape` collapses the card. Clicking elsewhere also collapses it.
+- **Right-click menu:** right-click the pill for Hide lyrics, Lock position, Desktop lyrics, Click-through, Karaoke highlight, Settings… and Quit. Show the island again from the tray menu, Settings or the hotkey.
 - **Desktop lyrics:** a large transparent overlay with the current line, off by default.
 - **Themes:** light, dark or system-following (`system`, `dark`, `light`) for the island and settings window.
 - **Karaoke highlight:** words light up as they are sung when the lyrics have word timings.
 - **Lyrics:** a local `.lrc` file if there is one, otherwise lrc.red, Better Lyrics, LRCLIB, KuGou, Netease and QQ Music, in that order. Only synced lyrics are used. Online results are cached in the user cache folder under `lyrics-island/desktop/`.
 
-Both overlay windows can be dragged; their positions are saved. In click-through mode they ignore the mouse, so use the tray menu or a hotkey to turn it off again.
+Both overlay windows can be dragged; their positions are saved. **Lock position** (right-click menu or tray) stops the island from being dragged. In click-through mode the overlays ignore the mouse, so use the tray menu or a hotkey to turn it off again.
 
 ## Install
 
-Download the build for your system from the `Desktop app` workflow artifacts on GitHub:
+Download the build for your system from the [latest GitHub release](https://github.com/yoelngl/lyrics-island/releases/latest) (or the `Desktop app` workflow artifacts for unreleased commits):
 
-- **Linux:** `lyrics-island_0.1.0_amd64.deb`, `lyrics-island-linux-x86_64.tar.gz` or the standalone `lyrics-island` binary.
-- **Windows:** `lyrics-island.exe`.
-- **macOS:** `Lyrics Island.app.zip`. The macOS app is not notarized: right-click it and choose **Open** the first time.
+| System | File |
+|---|---|
+| Debian, Ubuntu, Mint | `lyrics-island_<version>_amd64.deb` (`sudo apt install ./lyrics-island_*.deb`) |
+| Fedora, openSUSE, RHEL | `lyrics-island-<version>-1.x86_64.rpm` (`sudo dnf install ./lyrics-island-*.rpm`) |
+| Arch, Manjaro, EndeavourOS | `lyrics-island-<version>-1-x86_64.pkg.tar.zst` (`sudo pacman -U lyrics-island-*.pkg.tar.zst`) |
+| Any other Linux | `Lyrics_Island-<version>-x86_64.AppImage` (`chmod +x` and run), `lyrics-island-linux-x86_64.tar.gz` or the standalone `lyrics-island` binary |
+| Windows | `lyrics-island-<version>-windows-x86_64.exe` |
+| macOS (Apple silicon) | `Lyrics-Island-<version>-macos-arm64.dmg`: open it and drag **Lyrics Island** to Applications. The app is not notarized: right-click it and choose **Open** the first time. |
 
-On Debian or Ubuntu, install the `.deb` package:
+Linux packages need OpenSSL 3 and glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
 
-```sh
-sudo dpkg -i lyrics-island_0.1.0_amd64.deb
-```
+To cut a release, bump `version` in `app/Cargo.toml`, then push a matching tag (`git tag v0.1.0 && git push origin v0.1.0`); the workflow attaches every package above to the GitHub release.
 
 From the unpacked Linux tarball or from `desktop/` in a source checkout, `install.sh` installs the binary to `${PREFIX:-$HOME/.local}/bin/lyrics-island` together with the desktop entry and icon under `${XDG_DATA_HOME:-$HOME/.local/share}`:
 
@@ -59,6 +63,7 @@ The file is created with defaults on first start, and **Open config file** in th
 | Key | Default | Meaning |
 |---|---|---|
 | `ui.island_visible` | `true` | Show the island |
+| `ui.island_locked` | `false` | The island can't be dragged |
 | `ui.desktop_visible` | `false` | Show the desktop lyrics overlay |
 | `ui.click_through` | `false` | Both overlays ignore the mouse |
 | `ui.theme` | `"system"` | Colour theme for the island and settings window: `"system"`, `"dark"` or `"light"` |

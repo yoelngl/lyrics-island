@@ -149,6 +149,8 @@ pub struct UiConfig {
     /// Physical top-left; None = default placement (island top-center, desktop bottom-center of primary monitor).
     pub island_pos: Option<(i32, i32)>,
     pub desktop_pos: Option<(i32, i32)>,
+    /// The island ignores drags so it stays where it is.
+    pub island_locked: bool,
     /// Word-by-word highlight when word timings exist.
     pub karaoke: bool,
     pub desktop_font_px: f32,
@@ -169,6 +171,7 @@ impl Default for UiConfig {
             offset_ms: 0,
             island_pos: None,
             desktop_pos: None,
+            island_locked: false,
             karaoke: true,
             desktop_font_px: 34.0,
             island_max_width: 850.0,

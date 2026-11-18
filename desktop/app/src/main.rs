@@ -29,6 +29,7 @@ use model::{ArtRef, Command, Lyrics, MediaEvent, PlayerState, Rgba, Theme, Track
 pub enum Action {
     OpenSettings,
     ToggleIsland,
+    ToggleLock,
     ToggleDesktop,
     ToggleClickThrough,
     ToggleKaraoke,
@@ -159,6 +160,7 @@ impl App {
                 return;
             }
             Action::ToggleIsland => self.cfg.ui.island_visible = !self.cfg.ui.island_visible,
+            Action::ToggleLock => self.cfg.ui.island_locked = !self.cfg.ui.island_locked,
             Action::ToggleDesktop => self.cfg.ui.desktop_visible = !self.cfg.ui.desktop_visible,
             Action::ToggleClickThrough => self.cfg.ui.click_through = !self.cfg.ui.click_through,
             Action::ToggleKaraoke => self.cfg.ui.karaoke = !self.cfg.ui.karaoke,

@@ -69,6 +69,7 @@ pub(crate) struct Emitter {
 
 impl Emitter {
     /// Last state forwarded to the app, which MPRIS needs to tell stale Position values from seeks.
+    #[cfg(target_os = "linux")]
     pub(crate) fn last(&self) -> Option<&PlayerState> {
         self.last.as_ref()
     }

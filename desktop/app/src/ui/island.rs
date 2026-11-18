@@ -33,6 +33,33 @@ const BUTTON_R: f32 = 18.0;
 /// 44px diameter hit target around each transport button, leaving 20px clear gap between neighbors.
 const BUTTON_HIT_R: f32 = 22.0;
 const DEFAULT_TRACK_X: (f32, f32) = (62.0, EXPANDED_W - 62.0);
+/// Settings gear center in the expanded card's top-right corner, logical px from the card origin.
+const GEAR: (f32, f32) = (EXPANDED_W - CARD_PAD_X - 10.0, 30.0);
+
+/// Right-click menu entries, top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuItem {
+    Hide,
+    Lock,
+    Desktop,
+    ClickThrough,
+    Karaoke,
+    Settings,
+    Quit,
+}
+pub const MENU: [(MenuItem, &str); 7] = [
+    (MenuItem::Hide, "Hide lyrics"),
+    (MenuItem::Lock, "Lock position"),
+    (MenuItem::Desktop, "Desktop lyrics"),
+    (MenuItem::ClickThrough, "Click-through"),
+    (MenuItem::Karaoke, "Karaoke highlight"),
+    (MenuItem::Settings, "Settings\u{2026}"),
+    (MenuItem::Quit, "Quit"),
+];
+const MENU_W: f32 = 232.0;
+const MENU_PAD: f32 = 8.0;
+const MENU_ROW_H: f32 = 34.0;
+const MENU_H: f32 = MENU_PAD * 2.0 + MENU_ROW_H * MENU.len() as f32;
 
 const TITLE: Style = style(14.67, 18.0, 700);
 const ARTIST: Style = style(13.33, 17.0, 400);
@@ -40,6 +67,7 @@ const SIDE: Style = style(13.33, 18.0, 400);
 const CUR: Style = style(17.33, 22.0, 700);
 const TIME: Style = style(11.33, 14.0, 400);
 const CREDIT: Style = style(10.67, 14.0, 400);
+const MENU_LABEL: Style = style(13.33, 18.0, 400);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -47,6 +75,9 @@ pub enum Hit {
     Progress,
     PrevLine,
     NextLine,
+    /// Gear in the expanded card: opens the Settings window.
+    Settings,
+    Menu(MenuItem),
 }
 
 /// Logical height of the compact pill for a point size, never shorter than `PILL_H`.
@@ -143,6 +174,8 @@ pub struct Ctx<'a> {
     pub art_large: Option<&'a Pixmap>,
     /// Raw untoned album-art colors; toned inside `render` using `tone_art_gradient(..., c.light)`.
     pub gradient: Option<([u8; 3], [u8; 3])>,
+    /// Check marks for `MENU` rows, same order.
+    pub menu_checked: [bool; MENU.len()],
 }
 
 /// A label whose text changes slide out up and fade in from below (island.js _swapText).
@@ -264,6 +297,11 @@ impl Bars {
 
 pub struct Island {
     pub expanded: bool,
+    /// The expanded shape shows the right-click menu instead of the now-playing card.
+    pub menu: bool,
+    /// Which compact-pill edge the expanded shape keeps fixed: 0.0 left (grows right), 0.5 center, 1.0 right.
+    pub align: f32,
+    menu_labels: [Label; MENU.len()],
     pub w: Anim,
     pub h: Anim,
     compact_a: Anim,
@@ -296,6 +334,13 @@ impl Island {
     pub fn new(now: Instant) -> Self {
         Self {
             expanded: false,
+            menu: false,
+            align: 0.5,
+            menu_labels: std::array::from_fn(|i| {
+                let mut l = Label::new();
+                l.set(MENU[i].1);
+                l
+            }),
             w: Anim::new(PILL_MIN_W, now),
             h: Anim::new(PILL_H, now),
             compact_a: Anim::new(1.0, now),
@@ -355,20 +400,54 @@ impl Island {
     }
 
     pub fn expand(&mut self, now: Instant) {
-        if self.expanded {
+        self.open(now, false);
+    }
+
+    pub fn open_menu(&mut self, now: Instant) {
+        self.open(now, true);
+    }
+
+    /// Logical size of the expanded shape for the current mode.
+    fn card_size(&self) -> (f32, f32) {
+        if self.menu {
+            (MENU_W, MENU_H)
+        } else {
+            (EXPANDED_W, EXPANDED_H)
+        }
+    }
+
+    /// Expands into the card or the menu; switching while expanded morphs and cross-fades the content.
+    fn open(&mut self, now: Instant, menu: bool) {
+        if self.expanded && self.menu == menu {
             return;
         }
+        let switching = self.expanded;
         self.expanded = true;
-        let text = self.cur.pending.take().unwrap_or_default();
-        if !text.is_empty() {
-            self.cur.label.set(&text);
-        }
-        self.cur.t0 = None;
+        self.menu = menu;
+        self.hover = None;
+        self.pressed = None;
+        self.focus = None;
         self.left_at = None;
-        self.compact_a.set(0.0, 85, 0, ease_out_quad, now);
-        self.w.set(EXPANDED_W, 310, 0, ease_out_spring, now);
-        self.h.set(EXPANDED_H, 310, 0, ease_out_spring, now);
+        if switching {
+            self.expanded_a.jump(0.0);
+        } else {
+            let text = self.cur.pending.take().unwrap_or_default();
+            if !text.is_empty() {
+                self.cur.label.set(&text);
+            }
+            self.cur.t0 = None;
+            self.compact_a.set(0.0, 85, 0, ease_out_quad, now);
+        }
+        let (w, h) = self.card_size();
+        self.w.set(w, 310, 0, ease_out_spring, now);
+        self.h.set(h, 310, 0, ease_out_spring, now);
         self.expanded_a.set(1.0, 180, 55, ease_out_quad, now);
+    }
+
+    /// Left edge of a `w`-wide shape: keeps the compact pill's `align` edge fixed, clamped to the canvas.
+    fn box_x(&self, win_w: f32, center_x: f32, scale: f32, w: f32) -> f32 {
+        let pw = (self.pill_w * scale).max(1.0);
+        (center_x - pw / 2.0 + (pw - w) * self.align).round().clamp(0.0, (win_w - w).max(0.0))
     }
 
     /// The caller re-runs fit_pill afterwards so the pill eases back to the current line.
@@ -400,7 +479,7 @@ impl Island {
     ) -> (f32, f32, f32, f32) {
         let w = (self.w.value(now) * scale).max(1.0);
         let h = (self.h.value(now) * scale).max(1.0);
-        let ox = box_x(win_size.0 as f32, center_x, w);
+        let ox = self.box_x(win_size.0 as f32, center_x, scale, w);
         let oy = box_y(win_size.1 as f32, expand_up, h);
         (ox, oy, w, h)
     }
@@ -416,14 +495,14 @@ impl Island {
     ) -> (f32, f32, f32, f32) {
         let cw = (self.pill_w * scale).max(1.0);
         let ch = (self.pill_h * scale).max(1.0);
-        (box_x(win_size.0 as f32, center_x, cw), box_y(win_size.1 as f32, expand_up, ch), cw, ch)
+        (self.box_x(win_size.0 as f32, center_x, scale, cw), box_y(win_size.1 as f32, expand_up, ch), cw, ch)
     }
 
     /// Expanded card origin `(eox, eoy)` in physical px.
     pub fn expanded_origin(&self, win_size: (u32, u32), scale: f32, center_x: f32, expand_up: bool) -> (f32, f32) {
-        let ew = EXPANDED_W * scale;
-        let eh = EXPANDED_H * scale;
-        (box_x(win_size.0 as f32, center_x, ew), box_y(win_size.1 as f32, expand_up, eh))
+        let (cw, ch) = self.card_size();
+        let (ew, eh) = (cw * scale, ch * scale);
+        (self.box_x(win_size.0 as f32, center_x, scale, ew), box_y(win_size.1 as f32, expand_up, eh))
     }
 
     /// Padded integer physical bounding box `(x, y, w, h)` of the active shape for input masking and dirty blits.
@@ -447,6 +526,16 @@ impl Island {
     pub fn hit_at(&self, x: f32, y: f32, has_prev: bool, has_next: bool, has_len: bool) -> Option<Hit> {
         if !self.expanded {
             return None;
+        }
+        if self.menu {
+            let row = ((y - MENU_PAD) / MENU_ROW_H).floor();
+            if !(MENU_PAD..=MENU_W - MENU_PAD).contains(&x) || row < 0.0 {
+                return None;
+            }
+            return MENU.get(row as usize).map(|&(item, _)| Hit::Menu(item));
+        }
+        if (x - GEAR.0).powi(2) + (y - GEAR.1).powi(2) <= BUTTON_HIT_R * BUTTON_HIT_R {
+            return Some(Hit::Settings);
         }
         if let Some(&(_, cmd)) = BUTTONS
             .iter()
@@ -482,18 +571,22 @@ impl Island {
 
     /// Cycles keyboard focus forward (`Tab`) or backward (`Shift+Tab`) through active expanded controls.
     pub fn move_focus(&mut self, reverse: bool, has_prev: bool, has_next: bool, has_len: bool) {
-        let mut items = Vec::with_capacity(6);
-        if has_prev {
+        let mut items = Vec::with_capacity(MENU.len());
+        if self.menu {
+            items.extend(MENU.iter().map(|&(item, _)| Hit::Menu(item)));
+        }
+        if has_prev && !self.menu {
             items.push(Hit::PrevLine);
         }
-        if has_next {
+        if has_next && !self.menu {
             items.push(Hit::NextLine);
         }
-        if has_len {
+        if has_len && !self.menu {
             items.push(Hit::Progress);
         }
-        for (_, cmd) in BUTTONS {
-            items.push(Hit::Button(cmd));
+        if !self.menu {
+            items.extend(BUTTONS.iter().map(|&(_, cmd)| Hit::Button(cmd)));
+            items.push(Hit::Settings);
         }
         let next = match self.focus.and_then(|cur| items.iter().position(|&item| item == cur)) {
             Some(i) if reverse => items[(i + items.len() - 1) % items.len()],
@@ -545,7 +638,11 @@ impl Island {
         let ea = self.expanded_a.value(now);
         if ea > 0.01 {
             let eorig = self.expanded_origin(win_size, s, c.center_x, c.expand_up);
-            self.render_expanded(pm, t, c, eorig, ea, pal);
+            if self.menu {
+                self.render_menu(pm, t, c, eorig, ea, pal);
+            } else {
+                self.render_expanded(pm, t, c, eorig, ea, pal);
+            }
         }
 
         // Reuse the cached mask and apply it strictly over the active shape's bounding rows/cols.
@@ -655,12 +752,25 @@ impl Island {
 
         draw_art(pm, c.art_large, (x(CARD_PAD_X), y(18.0), 56.0 * s), 12.0 * s, a, c.light);
         let meta_x = CARD_PAD_X + 56.0 + 12.0;
-        let meta_w = (EXPANDED_W - meta_x - 12.0 - BARS_W - CARD_PAD_X) * s;
+        // Bars sit left of the gear; the gear's 44px target spans 22px either side of GEAR.0.
+        let bars_x = GEAR.0 - 22.0 - BARS_W;
+        let meta_w = (bars_x - 12.0 - meta_x) * s;
         self.title.layout(t, TITLE, s, meta_w, 1);
         self.artist.layout(t, ARTIST, s, meta_w, 1);
         t.draw(pm, &self.title, (x(meta_x), y(28.5)), pal.primary.alpha(a), clip, None);
         t.draw(pm, &self.artist, (x(meta_x), y(46.5)), pal.secondary.alpha(a), clip, None);
-        draw_bars(pm, c.bars, (x(EXPANDED_W - CARD_PAD_X - BARS_W), y(46.0)), 20.0, s, pal.primary.alpha(a));
+        draw_bars(pm, c.bars, (x(bars_x), y(46.0)), 20.0, s, pal.primary.alpha(a));
+
+        let (gx, gy) = (x(GEAR.0), y(GEAR.1));
+        if self.pressed == Some(Hit::Settings) {
+            fill(pm, PathBuilder::from_circle(gx, gy, BUTTON_R * s), pal.btn_press_bg.alpha(a));
+        } else if self.hover == Some(Hit::Settings) {
+            fill(pm, PathBuilder::from_circle(gx, gy, BUTTON_R * s), pal.btn_hover_bg.alpha(a));
+        }
+        stroke(pm, gear_icon(gx, gy, s), 1.6 * s, pal.primary.alpha(a));
+        if self.focus == Some(Hit::Settings) {
+            stroke(pm, PathBuilder::from_circle(gx, gy, (BUTTON_R + 2.0) * s), 2.0 * s, pal.focus_ring.alpha(a));
+        }
 
         let text_w = (EXPANDED_W - 2.0 * CARD_PAD_X) * s;
         self.prev.layout(t, SIDE, s, text_w, 1);
@@ -808,10 +918,60 @@ impl Island {
         let cw = self.credit.width();
         t.draw(pm, &self.credit, (x(EXPANDED_W / 2.0) - cw / 2.0, y(258.0)), pal.secondary.alpha(a), clip, None);
     }
+
+    fn render_menu(&mut self, pm: &mut Pixmap, t: &mut Text, c: &Ctx, orig: (f32, f32), a: f32, pal: Palette) {
+        let (eox, eoy) = orig;
+        let s = c.scale;
+        let clip = (eox, eoy, eox + MENU_W * s, eoy + MENU_H * s);
+        let row_w = (MENU_W - 2.0 * MENU_PAD) * s;
+        for (i, &(item, _)) in MENU.iter().enumerate() {
+            let hit = Hit::Menu(item);
+            let (rx, ry) = (eox + MENU_PAD * s, eoy + (MENU_PAD + i as f32 * MENU_ROW_H) * s);
+            let row = || rrect(rx, ry, row_w, MENU_ROW_H * s, 8.0 * s);
+            if self.pressed == Some(hit) {
+                fill(pm, row(), pal.btn_press_bg.alpha(a));
+            } else if self.hover == Some(hit) {
+                fill(pm, row(), pal.line_hover_bg.alpha(a));
+            }
+            if self.focus == Some(hit) {
+                stroke(pm, row(), 2.0 * s, pal.focus_ring.alpha(a));
+            }
+            let label = &mut self.menu_labels[i];
+            label.layout(t, MENU_LABEL, s, row_w - 44.0 * s, 1);
+            let ty = ry + (MENU_ROW_H - MENU_LABEL.line) / 2.0 * s;
+            t.draw(pm, label, (rx + 12.0 * s, ty), pal.primary.alpha(a), clip, None);
+            if c.menu_checked[i] {
+                let (cx, cy) = (rx + row_w - 20.0 * s, ry + MENU_ROW_H / 2.0 * s);
+                let mut pb = PathBuilder::new();
+                pb.move_to(cx - 5.0 * s, cy);
+                pb.line_to(cx - 1.5 * s, cy + 3.5 * s);
+                pb.line_to(cx + 5.0 * s, cy - 4.0 * s);
+                stroke(pm, pb.finish(), 2.0 * s, pal.primary.alpha(a));
+            }
+        }
+    }
 }
 
-fn box_x(win_w: f32, center_x: f32, w: f32) -> f32 {
-    (center_x - w / 2.0).round().clamp(0.0, (win_w - w).max(0.0))
+/// Outlined 8-tooth gear with a center hole, ~18px across at scale 1.
+fn gear_icon(cx: f32, cy: f32, s: f32) -> Option<tiny_skia::Path> {
+    use std::f32::consts::FRAC_PI_4;
+    let (r_in, r_out) = (6.5 * s, 9.0 * s);
+    let pt = |r: f32, a: f32| (cx + r * a.cos(), cy + r * a.sin());
+    let mut pb = PathBuilder::new();
+    for i in 0..8 {
+        let a = i as f32 * FRAC_PI_4;
+        for (j, (r, da)) in [(r_in, -0.36), (r_out, -0.17), (r_out, 0.17), (r_in, 0.36)].into_iter().enumerate() {
+            let (px, py) = pt(r, a + da);
+            if i == 0 && j == 0 {
+                pb.move_to(px, py);
+            } else {
+                pb.line_to(px, py);
+            }
+        }
+    }
+    pb.close();
+    pb.push_circle(cx, cy, 2.8 * s);
+    pb.finish()
 }
 
 fn box_y(win_h: f32, expand_up: bool, h: f32) -> f32 {
@@ -1045,6 +1205,7 @@ mod tests {
             Hit::Button(Command::Previous),
             Hit::Button(Command::PlayPause),
             Hit::Button(Command::Next),
+            Hit::Settings,
         ];
         for expected in all {
             isl.move_focus(false, true, true, true);
@@ -1054,9 +1215,33 @@ mod tests {
         assert_eq!(isl.focus, Some(Hit::PrevLine));
 
         isl.move_focus(true, true, true, true);
-        assert_eq!(isl.focus, Some(Hit::Button(Command::Next)));
+        assert_eq!(isl.focus, Some(Hit::Settings));
 
         isl.collapse(now);
         assert_eq!(isl.focus, None);
+    }
+
+    #[test]
+    fn expanded_shape_grows_away_from_the_aligned_pill_edge_and_menu_rows_hit() {
+        let now = Instant::now();
+        let mut isl = Island::new(now);
+        let win = (850, 310);
+        let (cx, pw) = (425.0, isl.pill_w);
+        for (align, expect_x) in [(0.0, cx - pw / 2.0), (0.5, cx - EXPANDED_W / 2.0), (1.0, cx + pw / 2.0 - EXPANDED_W)] {
+            isl.align = align;
+            assert_eq!(isl.expanded_origin(win, 1.0, cx, false).0, expect_x.round(), "align {align}");
+            // The compact pill itself never moves with alignment.
+            assert_eq!(isl.compact_rect(win, 1.0, cx, false).0, (cx - pw / 2.0).round());
+        }
+
+        isl.open_menu(now);
+        let first = MENU_PAD + MENU_ROW_H / 2.0;
+        assert_eq!(isl.hit_at(MENU_W / 2.0, first, true, true, true), Some(Hit::Menu(MenuItem::Hide)));
+        let last = MENU_PAD + MENU_ROW_H * (MENU.len() as f32 - 0.5);
+        assert_eq!(isl.hit_at(MENU_W / 2.0, last, true, true, true), Some(Hit::Menu(MenuItem::Quit)));
+        assert_eq!(isl.hit_at(MENU_W / 2.0, MENU_H - 2.0, true, true, true), None);
+        assert_eq!(isl.hit_at(MENU_W + 4.0, first, true, true, true), None);
+        isl.expand(now);
+        assert_eq!(isl.hit_at(GEAR.0, GEAR.1, true, true, true), Some(Hit::Settings));
     }
 }

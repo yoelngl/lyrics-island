@@ -30,7 +30,7 @@ use crate::model::{
     self, Command, Line, Lyrics, PlayerChoice, PlayerState, Status, Theme, UiAction, UiConfig, WindowKind,
 };
 use desktop::Desktop;
-use island::{Bars, Hit, Island, EXPANDED_H, EXPANDED_W, PILL_MIN_W};
+use island::{Bars, Hit, Island, MenuItem, EXPANDED_H, EXPANDED_W, MENU, PILL_MIN_W};
 use settings::Settings;
 use text::Text;
 
@@ -86,14 +86,15 @@ impl Ui {
         let now = Instant::now();
         let (primary, mons) = Mon::discover(event_loop);
         let pill_anchor = resolve_pill_anchor(cfg.island_pos, &primary, &mons, cfg.island_font_pt);
-        let (isl_size, isl_pos, canvas_cx, expand_up) =
+        let (isl_size, isl_pos, canvas_cx, expand_up, align) =
             island_canvas_geometry(pill_anchor, cfg, &primary, &mons, primary.scale);
         let mut isl_s = Surface::new(event_loop, "Lyrics Island", isl_size, isl_pos, true, now);
         let (dsize, dpos) = desk_geometry(&primary, cfg, primary.scale);
         let mut desk_s = Surface::new(event_loop, "Lyrics Island Desktop Lyrics", dsize, dpos, true, now);
         desk_s.set_input_rect(None, primary.scale as f32, cfg.click_through);
 
-        let isl = Island::new(now);
+        let mut isl = Island::new(now);
+        isl.align = align;
         let init_bounds = isl.bounds(isl_size, primary.scale as f32, canvas_cx, expand_up, now);
         isl_s.set_input_rect(Some(init_bounds), primary.scale as f32, cfg.click_through);
 
@@ -317,7 +318,7 @@ impl Ui {
                 self.collapse(now);
             }
             WindowEvent::KeyboardInput { event, .. } if island && event.state == ElementState::Pressed => {
-                if let Some(a) = self.on_island_key(&event.logical_key, now) {
+                if let Some(a) = self.on_island_key(event_loop, &event.logical_key, now) {
                     out.push(a);
                 }
             }
@@ -342,13 +343,16 @@ impl Ui {
                     self.isl_s.redraw();
                     return out;
                 }
+                let locked = island && self.cfg.island_locked;
                 let s = self.surface(kind);
                 if let Some(p0) = s.press {
                     if (position.x - p0.x).hypot(position.y - p0.y) > DRAG_PX * s.window.scale_factor() {
                         s.press = None;
-                        s.drag_origin_pos = s.pos;
-                        s.dragged_to = None;
-                        s.dragging = s.window.drag_window().is_ok();
+                        if !locked {
+                            s.drag_origin_pos = s.pos;
+                            s.dragged_to = None;
+                            s.dragging = s.window.drag_window().is_ok();
+                        }
                         self.isl.pressed = None;
                     }
                 }
@@ -396,12 +400,21 @@ impl Ui {
                             }
                         }
                         if self.surface(kind).press.take().is_some() && island {
-                            out.extend(self.click(now));
+                            out.extend(self.click(event_loop, now));
                         }
                         if self.isl.pressed.take().is_some() {
                             self.isl_s.redraw();
                         }
                     }
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. }
+                if island && self.point_in_island_shape(now) =>
+            {
+                if self.isl.expanded && self.isl.menu {
+                    self.collapse(now);
+                } else {
+                    self.expand(now, true);
                 }
             }
             _ => {}
@@ -650,9 +663,10 @@ impl Ui {
 
     fn place_island_canvas(&mut self, now: Instant) {
         let scale = self.isl_s.window.scale_factor();
-        let (size, pos, cx, expand_up) =
+        let (size, pos, cx, expand_up, align) =
             island_canvas_geometry(self.pill_anchor, &self.cfg, &self.primary, &self.mons, scale);
         self.canvas_cx = cx;
+        self.isl.align = align;
         self.expand_up = expand_up;
         self.isl_s.place(size, pos);
         self.sync_island_input_rect(now);
@@ -669,11 +683,16 @@ impl Ui {
         self.desk_s.place(size, pos);
     }
 
-    fn expand(&mut self, now: Instant) {
-        if self.cfg.click_through || self.isl.expanded {
+    /// Opens the now-playing card, or the right-click menu when `menu`.
+    fn expand(&mut self, now: Instant, menu: bool) {
+        if self.cfg.click_through || (self.isl.expanded && self.isl.menu == menu) {
             return;
         }
-        self.isl.expand(now);
+        if menu {
+            self.isl.open_menu(now);
+        } else {
+            self.isl.expand(now);
+        }
         self.sync_island_input_rect(now);
         self.isl_s.window.focus_window();
         self.isl_s.redraw();
@@ -712,13 +731,13 @@ impl Ui {
         (has_prev, has_next, has_len)
     }
 
-    fn click(&mut self, now: Instant) -> Option<UiAction> {
+    fn click(&mut self, el: &ActiveEventLoop, now: Instant) -> Option<UiAction> {
         if !self.isl.expanded {
-            self.expand(now);
+            self.expand(now, false);
             return None;
         }
         match self.hit_under() {
-            Some(h) if self.isl.pressed == Some(h) => self.activate_hit(h),
+            Some(h) if self.isl.pressed == Some(h) => self.activate_hit(el, h, now),
             Some(_) => None,
             None => {
                 self.collapse(now);
@@ -727,16 +746,40 @@ impl Ui {
         }
     }
 
-    fn activate_hit(&self, hit: Hit) -> Option<UiAction> {
+    fn activate_hit(&mut self, el: &ActiveEventLoop, hit: Hit, now: Instant) -> Option<UiAction> {
         match hit {
             Hit::Button(cmd) => Some(UiAction::Player(cmd)),
             Hit::PrevLine => self.prev_line_target_ms().map(|ms| UiAction::Player(Command::Seek(ms))),
             Hit::NextLine => self.next_line_target_ms().map(|ms| UiAction::Player(Command::Seek(ms))),
             Hit::Progress => None,
+            Hit::Settings => self.activate_menu(el, MenuItem::Settings, now),
+            Hit::Menu(item) => self.activate_menu(el, item, now),
         }
     }
 
-    fn on_island_key(&mut self, key: &Key, now: Instant) -> Option<UiAction> {
+    /// Menu choices close the menu; toggles go through the app shell like the tray and Settings do.
+    fn activate_menu(&mut self, el: &ActiveEventLoop, item: MenuItem, now: Instant) -> Option<UiAction> {
+        self.collapse(now);
+        let mut cfg = self.cfg.clone();
+        match item {
+            MenuItem::Hide => cfg.island_visible = false,
+            MenuItem::Lock => cfg.island_locked = !cfg.island_locked,
+            MenuItem::Desktop => cfg.desktop_visible = !cfg.desktop_visible,
+            MenuItem::ClickThrough => cfg.click_through = !cfg.click_through,
+            MenuItem::Karaoke => cfg.karaoke = !cfg.karaoke,
+            MenuItem::Settings => {
+                self.open_settings(el);
+                return None;
+            }
+            MenuItem::Quit => {
+                el.exit();
+                return None;
+            }
+        }
+        Some(UiAction::SetUiConfig(cfg))
+    }
+
+    fn on_island_key(&mut self, el: &ActiveEventLoop, key: &Key, now: Instant) -> Option<UiAction> {
         if !self.isl.expanded {
             return None;
         }
@@ -751,9 +794,12 @@ impl Ui {
                 self.isl_s.redraw();
                 None
             }
-            Key::Named(NamedKey::Enter) => self.isl.focus.and_then(|f| self.activate_hit(f)),
+            Key::Named(NamedKey::Enter) => match self.isl.focus {
+                Some(f) => self.activate_hit(el, f, now),
+                None => None,
+            },
             Key::Named(NamedKey::Space) => match self.isl.focus {
-                Some(f) if f != Hit::Progress => self.activate_hit(f),
+                Some(f) if f != Hit::Progress => self.activate_hit(el, f, now),
                 _ => Some(UiAction::Player(Command::PlayPause)),
             },
             Key::Named(NamedKey::ArrowLeft) => {
@@ -926,6 +972,13 @@ impl Ui {
                     art_small: art.as_ref().and_then(|a| a.small.as_ref()),
                     art_large: art.as_ref().and_then(|a| a.large.as_ref()),
                     gradient: art.as_ref().and_then(|a| a.gradient),
+                    menu_checked: MENU.map(|(item, _)| match item {
+                        MenuItem::Lock => cfg.island_locked,
+                        MenuItem::Desktop => cfg.desktop_visible,
+                        MenuItem::ClickThrough => cfg.click_through,
+                        MenuItem::Karaoke => cfg.karaoke,
+                        MenuItem::Hide | MenuItem::Settings | MenuItem::Quit => false,
+                    }),
                 };
                 isl.render(pm, text, &ctx);
                 // Content is laid out at its final size while the shape morphs, so it can spill past the shape;
@@ -1008,6 +1061,8 @@ struct Surface {
     presenter: present::Presenter,
     pixmap: Option<Pixmap>,
     prev_bounds: Option<(u32, u32, u32, u32)>,
+    /// Only X11 needs it, to set EWMH state before mapping.
+    #[cfg(target_os = "linux")]
     overlay: bool,
     shown: bool,
     want: bool,
@@ -1059,6 +1114,7 @@ impl Surface {
             presenter,
             pixmap: None,
             prev_bounds: None,
+            #[cfg(target_os = "linux")]
             overlay,
             shown: false,
             want: false,
@@ -1239,9 +1295,10 @@ fn island_canvas_geometry(
     primary: &Mon,
     mons: &[Mon],
     scale: f64,
-) -> ((u32, u32), (i32, i32), f32, bool) {
+) -> ((u32, u32), (i32, i32), f32, bool, f32) {
     let mon = monitor_at(anchor, primary, mons);
-    let max_logical_w = cfg.island_max_width.max(EXPANDED_W + 32.0);
+    // Two card widths so a left- or right-aligned card fits beside a centered pill.
+    let max_logical_w = cfg.island_max_width.max(2.0 * EXPANDED_W);
     let cw = ((max_logical_w as f64 * scale).ceil() as u32)
         .min((mon.w as f64 * 0.92) as u32)
         .max(200);
@@ -1258,7 +1315,16 @@ fn island_canvas_geometry(
         anchor.1
     };
     let canvas_cx = (anchor.0 - win_x) as f32;
-    ((cw, ch), (win_x, win_y), canvas_cx, expand_up)
+    // Pill in the left/right third of its monitor: the card grows away from that screen edge.
+    let frac = (anchor.0 - mon.x) as f32 / mon.w.max(1) as f32;
+    let align = if frac < 1.0 / 3.0 {
+        0.0
+    } else if frac > 2.0 / 3.0 {
+        1.0
+    } else {
+        0.5
+    };
+    ((cw, ch), (win_x, win_y), canvas_cx, expand_up, align)
 }
 
 fn desk_geometry(mon: &Mon, cfg: &UiConfig, scale: f64) -> ((u32, u32), (i32, i32)) {
@@ -1319,12 +1385,12 @@ fn thumb(src: &model::Rgba, n: u32) -> Option<Pixmap> {
     let (x0, y0) = ((w - side) / 2, (h - side) / 2);
     let n = n as usize;
     let span = |i: usize| (i * side / n, ((i + 1) * side / n).max(i * side / n + 1));
-    for (i, px) in pm.data_mut().chunks_exact_mut(4).enumerate() {
+    for (i, px) in pm.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let ((sx0, sx1), (sy0, sy1)) = (span(i % n), span(i / n));
         let mut acc = [0u32; 4];
         for y in sy0..sy1 {
             let row = &src.data[((y0 + y) * w + x0 + sx0) * 4..((y0 + y) * w + x0 + sx1) * 4];
-            for p in row.chunks_exact(4) {
+            for p in row.as_chunks::<4>().0 {
                 let a = p[3] as u32;
                 acc[0] += p[0] as u32 * a;
                 acc[1] += p[1] as u32 * a;
@@ -1492,8 +1558,11 @@ mod tests {
         let mon = Mon { x: 0, y: 0, w: 1366, h: 768, scale: 1.0 };
         let cfg = UiConfig::default();
         let anchor = resolve_pill_anchor(Some((683, 661)), &mon, &[mon], cfg.island_font_pt);
-        let (size, pos, cx, expand_up) = island_canvas_geometry(anchor, &cfg, &mon, &[mon], 1.0);
+        let (size, pos, cx, expand_up, align) = island_canvas_geometry(anchor, &cfg, &mon, &[mon], 1.0);
         assert!(expand_up, "pill at y=661 on 768px screen expands upward");
+        assert_eq!(align, 0.5, "centered pill expands both ways");
+        assert_eq!(island_canvas_geometry((100, 0), &cfg, &mon, &[mon], 1.0).4, 0.0, "left third grows right");
+        assert_eq!(island_canvas_geometry((1300, 0), &cfg, &mon, &[mon], 1.0).4, 1.0, "right third grows left");
         let isl = Island::new(Instant::now());
         let (cox, coy, cw, ch) = isl.compact_rect(size, 1.0, cx, expand_up);
         // Screen Y of the compact pill matches anchor.1 (661) and screen center X matches anchor.0 (683).
