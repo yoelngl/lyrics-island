@@ -64,6 +64,10 @@ gsettings --schemadir ~/.local/share/gnome-shell/extensions/lyrics-island@b-log/
 - **Only title and artist:** neither lyrics source has synced lyrics for that track.
 - **Errors:** `journalctl --user -b -o cat | grep lyrics-island`
 
+## Desktop app
+
+[`desktop/`](desktop/README.md) holds a standalone port for Windows, macOS and Linux that runs without GNOME Shell. It includes the floating island (with light, dark and system themes, configurable compact width and font size, and interactive seeking via the progress bar, lyric lines or keyboard), a large desktop-lyrics overlay, word-by-word karaoke highlight, local `.lrc` folders, an in-app settings window with live `config.json` reload, player switching, launch at login, tray controls and global hotkeys. On Linux it uses event-driven MPRIS, supports Wayland (XWayland by default, native `wl_shm` fallback via `LYRICS_ISLAND_BACKEND=wayland`, and `org.freedesktop.portal.GlobalShortcuts`), and ships with `./install.sh` plus `.deb` and `.tar.gz` packages from the `Desktop app` GitHub workflow alongside the Windows `.exe` and macOS `.app.zip` builds.
+
 ## Development
 
 `tools/fake-player.js` is a fake MPRIS player for testing without a real app:

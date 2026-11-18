@@ -1,0 +1,125 @@
+name: Desktop app
+
+on:
+  push:
+    paths: ["desktop/**", ".github/workflows/desktop.yml"]
+  pull_request:
+    paths: ["desktop/**", ".github/workflows/desktop.yml"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dev packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libx11-dev libxcb1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --release --workspace
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          install -m 0755 target/release/lyrics-island dist/lyrics-island
+
+          stage_tar=$(mktemp -d)
+          chmod 0755 "$stage_tar"
+          mkdir -m 0755 -p "$stage_tar/packaging"
+          install -m 0755 target/release/lyrics-island "$stage_tar/lyrics-island"
+          install -m 0755 install.sh "$stage_tar/install.sh"
+          install -m 0644 packaging/lyrics-island.desktop "$stage_tar/packaging/lyrics-island.desktop"
+          install -m 0644 packaging/lyrics-island.svg "$stage_tar/packaging/lyrics-island.svg"
+          tar -C "$stage_tar" --owner=0 --group=0 -czf dist/lyrics-island-linux-x86_64.tar.gz \
+            lyrics-island install.sh packaging/lyrics-island.desktop packaging/lyrics-island.svg
+          rm -rf "$stage_tar"
+
+          stage_deb=$(mktemp -d)
+          chmod 0755 "$stage_deb"
+          mkdir -p \
+            "$stage_deb/DEBIAN" \
+            "$stage_deb/usr/bin" \
+            "$stage_deb/usr/share/applications" \
+            "$stage_deb/usr/share/icons/hicolor/scalable/apps"
+          chmod 0755 \
+            "$stage_deb/DEBIAN" \
+            "$stage_deb/usr" \
+            "$stage_deb/usr/bin" \
+            "$stage_deb/usr/share" \
+            "$stage_deb/usr/share/applications" \
+            "$stage_deb/usr/share/icons" \
+            "$stage_deb/usr/share/icons/hicolor" \
+            "$stage_deb/usr/share/icons/hicolor/scalable" \
+            "$stage_deb/usr/share/icons/hicolor/scalable/apps"
+          install -m 0755 target/release/lyrics-island "$stage_deb/usr/bin/lyrics-island"
+          install -m 0644 packaging/lyrics-island.desktop "$stage_deb/usr/share/applications/lyrics-island.desktop"
+          install -m 0644 packaging/lyrics-island.svg "$stage_deb/usr/share/icons/hicolor/scalable/apps/lyrics-island.svg"
+          printf '%s\n' \
+            'Package: lyrics-island' \
+            'Version: 0.1.0' \
+            'Section: sound' \
+            'Priority: optional' \
+            'Architecture: amd64' \
+            'Depends: libc6, libssl3 | libssl1.1, libx11-6, libxcb1' \
+            'Maintainer: Lyrics Island Contributors' \
+            'Description: Dynamic Island-style synced lyrics overlay' \
+            > "$stage_deb/DEBIAN/control"
+          chmod 0644 "$stage_deb/DEBIAN/control"
+          dpkg-deb --root-owner-group --build "$stage_deb" dist/lyrics-island_0.1.0_amd64.deb
+          rm -rf "$stage_deb"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        run: mkdir dist && cp target/release/lyrics-island.exe dist/
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          app="dist/Lyrics Island.app/Contents"
+          mkdir -p "$app/MacOS" "$app/Frameworks"
+          cp target/release/lyrics-island "$app/MacOS/"
+          cp target/release/libmr_helper.dylib "$app/Frameworks/"
+          cat > "$app/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Lyrics Island</string>
+            <key>CFBundleIdentifier</key><string>dev.blog.lyrics-island</string>
+            <key>CFBundleExecutable</key><string>lyrics-island</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>LSUIElement</key><true/>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSAppleEventsUsageDescription</key><string>Reads the current track from Spotify and Music.</string>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "dist/Lyrics Island.app"
+          cd dist && ditto -c -k --keepParent "Lyrics Island.app" "Lyrics Island.app.zip" && rm -rf "Lyrics Island.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lyrics-island-${{ runner.os }}
+          path: desktop/dist/*

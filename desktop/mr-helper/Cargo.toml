@@ -1,0 +1,15 @@
+[package]
+name = "mr-helper"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "MediaRemote bridge loaded into /usr/bin/perl, which keeps MediaRemote access on macOS 15.4+"
+
+[lib]
+name = "mr_helper"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDate", "NSDictionary", "NSString", "NSValue", "NSObject"] }
+block2 = "0.6"

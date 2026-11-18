@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lyrics Island
+Comment=Time-synced lyrics overlay
+Exec=lyrics-island
+Icon=lyrics-island
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=false

@@ -1,0 +1,342 @@
+//! Linux window presentation over X11 (PutImage) or native Wayland (wl_shm).
+
+use std::ffi::c_void;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind};
+use std::os::fd::AsFd;
+use std::path::Path;
+
+use memmap2::MmapMut;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+use tiny_skia::Pixmap;
+use wayland_backend::client::{Backend, ObjectId};
+use wayland_client::protocol::{
+    wl_buffer::WlBuffer,
+    wl_compositor::WlCompositor,
+    wl_region::WlRegion,
+    wl_registry::{self, WlRegistry},
+    wl_shm::{self, WlShm},
+    wl_shm_pool::WlShmPool,
+    wl_surface::WlSurface,
+};
+use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use winit::window::Window;
+use x11rb::connection::{Connection as _, RequestConnection as _};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, CreateGCAux, ImageFormat, ImageOrder, PropMode};
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
+
+pub struct Presenter(Inner);
+
+enum Inner {
+    X11(X11Presenter),
+    Wayland(WaylandPresenter),
+}
+
+impl Presenter {
+    pub fn new(window: &Window) -> Self {
+        let wh = window.window_handle().expect("window handle").as_raw();
+        let dh = window.display_handle().expect("display handle").as_raw();
+        match (wh, dh) {
+            (RawWindowHandle::Xlib(h), _) => Self(Inner::X11(X11Presenter::new(h.window as u32))),
+            (RawWindowHandle::Xcb(h), _) => Self(Inner::X11(X11Presenter::new(h.window.get()))),
+            (RawWindowHandle::Wayland(wh), RawDisplayHandle::Wayland(dh)) => {
+                Self(Inner::Wayland(WaylandPresenter::new(dh.display.as_ptr(), wh.surface.as_ptr())))
+            }
+            _ => panic!("lyrics-island needs an X11 or Wayland window"),
+        }
+    }
+
+    /// Call right before mapping: EWMH says withdrawn windows declare their state via the property,
+    /// and WMs drop it on unmap. Non-overlay windows (Settings) stay normal taskbar windows.
+    pub fn prepare_show(&self, overlay: bool) {
+        if let Inner::X11(x11) = &self.0 {
+            x11.prepare_show(overlay);
+        }
+    }
+
+    pub fn set_click_through(&mut self, click_through: bool) {
+        if let Inner::Wayland(wl) = &mut self.0 {
+            wl.set_click_through(click_through);
+        }
+    }
+
+    pub fn present(&mut self, _window: &Window, pm: &Pixmap) {
+        match &mut self.0 {
+            Inner::X11(x11) => x11.present(pm),
+            Inner::Wayland(wl) => wl.present(pm),
+        }
+    }
+}
+
+struct X11Presenter {
+    conn: RustConnection,
+    win: u32,
+    gc: u32,
+    state: [u32; 5],
+    /// 32 with winit's ARGB visual; 24 when the server offers none (no per-pixel alpha then).
+    depth: u8,
+    buf: Vec<u8>,
+}
+
+impl X11Presenter {
+    fn new(win: u32) -> Self {
+        let (conn, _) = x11rb::connect(None).expect("lyrics-island needs an X11 display");
+        let gc = conn.generate_id().expect("X11 id");
+        conn.create_gc(gc, win, &CreateGCAux::new()).expect("X11 create_gc");
+        let atom = |name: &[u8]| conn.intern_atom(false, name).ok().and_then(|c| c.reply().ok()).map_or(0, |r| r.atom);
+        let state = [
+            atom(b"_NET_WM_STATE"),
+            atom(b"_NET_WM_STATE_SKIP_TASKBAR"),
+            atom(b"_NET_WM_STATE_SKIP_PAGER"),
+            atom(b"_NET_WM_STATE_ABOVE"),
+            atom(b"_NET_WM_USER_TIME"),
+        ];
+        let depth = conn.get_geometry(win).ok().and_then(|c| c.reply().ok()).map_or(32, |g| g.depth);
+        Self { conn, win, gc, state, depth, buf: Vec::new() }
+    }
+
+    fn prepare_show(&self, overlay: bool) {
+        if !overlay {
+            return;
+        }
+        let [prop, skip_taskbar, skip_pager, above, user_time] = self.state;
+        let _ = self.conn.change_property32(
+            PropMode::REPLACE,
+            self.win,
+            prop,
+            AtomEnum::ATOM,
+            &[skip_taskbar, skip_pager, above],
+        );
+        // User time 0 asks the WM not to steal focus when mapping the overlay.
+        let _ = self.conn.change_property32(PropMode::REPLACE, self.win, user_time, AtomEnum::CARDINAL, &[0]);
+        // Round trip so the properties land before winit maps the window on its own connection.
+        let _ = self.conn.get_input_focus().map(|c| c.reply());
+    }
+
+    fn present(&mut self, pm: &Pixmap) {
+        let (w, h) = (pm.width() as usize, pm.height() as usize);
+        let msb = self.conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
+        self.buf.clear();
+        self.buf.extend(pm.data().chunks_exact(4).flat_map(|p| {
+            if msb { [p[3], p[0], p[1], p[2]] } else { [p[2], p[1], p[0], p[3]] }
+        }));
+        let stride = w * 4;
+        // PutImage header is 24 bytes; BIG-REQUESTS adds 4 more.
+        let rows = ((self.conn.maximum_request_bytes() - 28) / stride).clamp(1, h.max(1));
+        let mut y = 0;
+        while y < h {
+            let n = rows.min(h - y);
+            let _ = self.conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                self.win,
+                self.gc,
+                w as u16,
+                n as u16,
+                0,
+                y as i16,
+                0,
+                self.depth,
+                &self.buf[y * stride..(y + n) * stride],
+            );
+            y += n;
+        }
+        let _ = self.conn.flush();
+        // Unchecked request errors are queued as events; drain so they can't pile up.
+        while let Ok(Some(_)) = self.conn.poll_for_event() {}
+    }
+}
+
+impl Drop for X11Presenter {
+    fn drop(&mut self) {
+        let _ = self.conn.free_gc(self.gc);
+        let _ = self.conn.flush();
+    }
+}
+
+#[derive(Default)]
+struct RegistryState {
+    shm: Option<WlShm>,
+    compositor: Option<WlCompositor>,
+}
+
+impl Dispatch<WlRegistry, ()> for RegistryState {
+    fn event(
+        state: &mut Self,
+        registry: &WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            match interface.as_str() {
+                "wl_shm" if state.shm.is_none() => {
+                    state.shm = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "wl_compositor" if state.compositor.is_none() => {
+                    state.compositor = Some(registry.bind(name, version.min(4), qh, ()));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+delegate_noop!(RegistryState: ignore WlShm);
+delegate_noop!(RegistryState: ignore WlShmPool);
+delegate_noop!(RegistryState: ignore WlBuffer);
+delegate_noop!(RegistryState: ignore WlCompositor);
+delegate_noop!(RegistryState: ignore WlRegion);
+
+struct ShmSlot {
+    file: File,
+    mmap: MmapMut,
+    pool: WlShmPool,
+    cap: usize,
+    buffer: WlBuffer,
+    dims: (u32, u32),
+}
+
+struct WaylandPresenter {
+    conn: Connection,
+    event_queue: EventQueue<RegistryState>,
+    qh: QueueHandle<RegistryState>,
+    state: RegistryState,
+    surface: WlSurface,
+    shm: WlShm,
+    compositor: WlCompositor,
+    slot: Option<ShmSlot>,
+}
+
+impl WaylandPresenter {
+    fn new(display: *mut c_void, surface: *mut c_void) -> Self {
+        let backend = unsafe { Backend::from_foreign_display(display.cast()) };
+        let conn = Connection::from_backend(backend);
+        let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.cast()) }
+            .expect("Wayland surface id");
+        let surface = WlSurface::from_id(&conn, id).expect("Wayland surface");
+
+        let mut event_queue = conn.new_event_queue();
+        let qh = event_queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+        let mut state = RegistryState::default();
+        event_queue.roundtrip(&mut state).expect("Wayland registry roundtrip");
+        let shm = state.shm.clone().expect("Wayland wl_shm global");
+        let compositor = state.compositor.clone().expect("Wayland wl_compositor global");
+
+        Self { conn, event_queue, qh, state, surface, shm, compositor, slot: None }
+    }
+
+    fn set_click_through(&mut self, click_through: bool) {
+        if click_through {
+            let region = self.compositor.create_region(&self.qh, ());
+            self.surface.set_input_region(Some(&region));
+            region.destroy();
+        } else {
+            self.surface.set_input_region(None);
+        }
+        self.surface.commit();
+        let _ = self.conn.flush();
+    }
+
+    fn present(&mut self, pm: &Pixmap) {
+        let (w, h) = (pm.width(), pm.height());
+        if w == 0 || h == 0 {
+            return;
+        }
+        let byte_len = (w as usize) * (h as usize) * 4;
+        let stride = (w as i32) * 4;
+
+        let shm = &self.shm;
+        let qh = &self.qh;
+        let slot = self.slot.get_or_insert_with(|| {
+            let file = create_shm_file();
+            file.set_len(byte_len as u64).expect("Wayland shm set_len");
+            let mmap = unsafe { MmapMut::map_mut(&file) }.expect("Wayland shm mmap");
+            let pool = shm.create_pool(file.as_fd(), byte_len as i32, qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                w as i32,
+                h as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            );
+            ShmSlot { file, mmap, pool, cap: byte_len, buffer, dims: (w, h) }
+        });
+        // wl_shm_pool can only grow; shrinking the backing file while a buffer is mapped would SIGBUS.
+        if byte_len > slot.cap {
+            let cap = byte_len.max(slot.cap.saturating_mul(2));
+            slot.file.set_len(cap as u64).expect("Wayland shm resize");
+            slot.mmap = unsafe { MmapMut::map_mut(&slot.file) }.expect("Wayland shm mmap");
+            slot.pool.resize(cap as i32);
+            slot.cap = cap;
+        }
+        let old_buffer = if slot.dims != (w, h) {
+            let new_buf = slot.pool.create_buffer(
+                0,
+                w as i32,
+                h as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            );
+            slot.dims = (w, h);
+            Some(std::mem::replace(&mut slot.buffer, new_buf))
+        } else {
+            None
+        };
+
+        for (dst, src) in slot.mmap[..byte_len].chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
+            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+        }
+
+        self.surface.attach(Some(&slot.buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, w as i32, h as i32);
+        self.surface.commit();
+        if let Some(old) = old_buffer {
+            old.destroy();
+        }
+        let _ = self.conn.flush();
+        // Drain wl_buffer.release events queued by winit's socket reads without touching the socket.
+        let _ = self.event_queue.dispatch_pending(&mut self.state);
+    }
+}
+
+impl Drop for WaylandPresenter {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.buffer.destroy();
+            slot.pool.destroy();
+        }
+        let _ = self.conn.flush();
+    }
+}
+
+fn try_shm_in(dir: &Path) -> io::Result<File> {
+    let pid = std::process::id();
+    for i in 0..1024u32 {
+        let path = dir.join(format!("lyrics-island-shm-{pid}-{i}"));
+        match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                let _ = fs::remove_file(&path);
+                return Ok(file);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(ErrorKind::AlreadyExists, "exhausted Wayland shm temp names"))
+}
+
+fn create_shm_file() -> File {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        if let Ok(file) = try_shm_in(Path::new(&dir)) {
+            return file;
+        }
+    }
+    try_shm_in(&std::env::temp_dir()).expect("Wayland shm temp file")
+}

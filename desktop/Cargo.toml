@@ -1,0 +1,11 @@
+[workspace]
+members = ["app", "mr-helper"]
+resolver = "2"
+
+[profile.release]
+# Not "s": the software renderer's pixel loops run ~3x slower without full optimization.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
