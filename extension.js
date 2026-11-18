@@ -198,8 +198,11 @@ export default class LyricsIslandExtension extends Extension {
         const curLine = idx >= 0 ? lines[idx] : null;
         const nextLine = (idx >= 0 && idx + 1 < lines.length) ? lines[idx + 1] : null;
 
-        // Line stays active until next line or max 9s (during instrumental pauses/solos)
-        const maxDuration = nextLine ? Math.min(nextLine.t - curLine.t, 9000) : 8000;
+        // Known end time wins, bridged to the next line across breaths (<3s) so the title doesn't flash between lines;
+        // otherwise the line stays until the next one, capped at 9s for instrumental pauses/solos.
+        const end = curLine?.end !== undefined && nextLine && nextLine.t - curLine.end < 3000 ? nextLine.t : curLine?.end;
+        const maxDuration = end !== undefined ? end - curLine.t
+            : nextLine ? Math.min(nextLine.t - curLine.t, 9000) : 8000;
         const isLineActive = curLine && Boolean(curLine.text) && (t >= curLine.t) && (t < curLine.t + maxDuration);
 
         const compactText = isLineActive ? curLine.text : fallback;

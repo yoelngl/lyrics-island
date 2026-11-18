@@ -74,6 +74,7 @@ export const Island = GObject.registerClass({
         this._settings = settings;
         this._expanded = false;
         this._collapseId = 0;
+        this._grab = null;
         this._destroyed = false;
         this._pillHeight = Math.max(22, Main.panel.height - 6);
 
@@ -87,6 +88,11 @@ export const Island = GObject.registerClass({
                 this.collapse();
             else
                 this.expand();
+            return Clutter.EVENT_STOP;
+        });
+        // While expanded the modal grab routes outside clicks above; keys would be swallowed too, so collapse instead.
+        this.connect('key-press-event', () => {
+            this.collapse();
             return Clutter.EVENT_STOP;
         });
         this._monitorsId = Main.layoutManager.connect('monitors-changed', () => {
@@ -312,12 +318,19 @@ export const Island = GObject.registerClass({
             mode: Clutter.AnimationMode.EASE_OUT_BACK,
         });
         this._expandedBox.ease({opacity: 255, delay: 180, duration: 220, mode: EASE});
+        // Grab like a popup menu so a click anywhere else lands in our button-press handler and collapses.
+        this._grab = Main.pushModal(this);
+        if (!(this._grab.get_seat_state() & Clutter.GrabState.POINTER)) {
+            Main.popModal(this._grab);
+            this._grab = null;
+        }
     }
 
     collapse() {
         if (!this._expanded)
             return;
         this._expanded = false;
+        this._releaseGrab();
         this._line.opacity = 255;
         this._line.translation_y = 0;
         delete this._line._pendingText;
@@ -334,6 +347,12 @@ export const Island = GObject.registerClass({
         });
         this._compact.ease({opacity: 255, delay: 150, duration: 200, mode: EASE});
         this._resizeCompact(true);
+    }
+
+    _releaseGrab() {
+        if (this._grab)
+            Main.popModal(this._grab);
+        this._grab = null;
     }
 
     /** Runs the art-colored gradient (pill and expanded) while the island is shown and the art has colors. */
@@ -437,6 +456,7 @@ export const Island = GObject.registerClass({
 
     _onDestroy() {
         this._destroyed = true;
+        this._releaseGrab();
         if (this._collapseId)
             GLib.source_remove(this._collapseId);
         if (this._gradientId)

@@ -54,7 +54,7 @@ function titleMatches(candidate, target) {
     return matchCount >= Math.min(wordsC.size, wordsT.size) * 0.5;
 }
 
-/** Parses LRC text into [{t: ms, text}] sorted by time, or null. */
+/** Parses LRC text into [{t: ms, end?: ms, text}] sorted by time, or null. A trailing <mm:ss.xx> tag is the line's end. */
 export function parseLrc(lrc) {
     if (!lrc)
         return null;
@@ -69,13 +69,17 @@ export function parseLrc(lrc) {
             times.push(parseInt(m[1]) * 60000 + parseFloat(m[2].replace(':', '.')) * 1000);
             end = stamp.lastIndex;
         }
-        // Strip enhanced-LRC word timings like <00:41.17>; note-only (instrumental) lines count as empty.
-        const text = raw.slice(end).replace(/<\d+:\d+(?:[.:]\d+)?>/g, '').replace(/\s+/g, ' ').trim()
+        // Strip enhanced-LRC word timings like <00:41.17>; the last one, after the final word, ends the line.
+        const body = raw.slice(end);
+        const last = body.match(/<(\d+):(\d+(?:[.:]\d+)?)>\s*$/);
+        const lineEnd = last ? parseInt(last[1]) * 60000 + parseFloat(last[2].replace(':', '.')) * 1000 : undefined;
+        // Note-only (instrumental) lines count as empty.
+        const text = body.replace(/<\d+:\d+(?:[.:]\d+)?>/g, '').replace(/\s+/g, ' ').trim()
             .replace(/^[♪♫♬♩\s]+$/, '');
         if (CREDIT.test(text))
             continue;
         for (const t of times)
-            out.push({t, text});
+            out.push(lineEnd > t ? {t, end: lineEnd, text} : {t, text});
     }
     out.sort((a, b) => a.t - b.t);
     // Sources often open with a "Title - Artist" header line.
@@ -85,20 +89,27 @@ export function parseLrc(lrc) {
     return out.some(l => l.text) ? out : null;
 }
 
-/** Converts Better Lyrics TTML to line-level LRC text, or null. */
+/** Converts Better Lyrics TTML to line-level LRC text (with a trailing <end> tag when known), or null. */
 export function ttmlToLrc(ttml) {
     const entities = {amp: '&', lt: '<', gt: '>', quot: '"', apos: "'"};
+    // "s.mmm", "m:s.mmm" or "h:m:s.mmm" -> "m:ss.mmm"
+    const stamp = v => {
+        const s = v.split(':').reduce((acc, x) => acc * 60 + parseFloat(x), 0);
+        return s >= 0 ? `${Math.floor(s / 60)}:${(s % 60).toFixed(3)}` : null;
+    };
     const out = [];
-    for (const [, begin, body] of (ttml ?? '').matchAll(/<p\b[^>]*?\bbegin="([^"]+)"[^>]*>([\s\S]*?)<\/p>/g)) {
-        // begin is "s.mmm", "m:s.mmm" or "h:m:s.mmm"
-        const s = begin.split(':').reduce((acc, x) => acc * 60 + parseFloat(x), 0);
+    for (const [, attrs, body] of (ttml ?? '').matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/g)) {
+        const begin = attrs.match(/\bbegin="([^"]+)"/)?.[1];
+        const end = attrs.match(/\bend="([^"]+)"/)?.[1];
         const text = body
             .replace(/<span[^>]*x-(translation|roman)[^>]*>[^<]*<\/span>/g, '')
             .replace(/<[^>]+>/g, '')
             .replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => entities[e])
             .replace(/\s+/g, ' ').trim();
-        if (text && s >= 0)
-            out.push(`[${Math.floor(s / 60)}:${(s % 60).toFixed(3)}]${text}`);
+        const b = begin && stamp(begin);
+        const e = end && stamp(end);
+        if (text && b)
+            out.push(`[${b}]${text}${e ? `<${e}>` : ''}`);
     }
     return out.length ? out.join('\n') : null;
 }
@@ -204,8 +215,8 @@ export class LyricsProvider {
         if (cachedText && cachedText.trim().length > 0) {
             try {
                 const c = JSON.parse(cachedText);
-                // Refetch entries from before sources were recorded.
-                const usable = 'source' in c;
+                // Refetch entries from older cache formats (v2 keeps TTML line end times).
+                const usable = c.v === 2;
                 if (usable && (c.syncedLyrics || Date.now() - c.fetchedAt < NEGATIVE_TTL_MS))
                     return {synced: parseLrc(c.syncedLyrics), source: c.source ?? null};
             } catch {
@@ -295,12 +306,27 @@ export class LyricsProvider {
 
         // The Better Lyrics browser extension fills the API cache when the song starts; give it time, then retry once.
         if (!rec && dur > 0) {
-            await new Promise(r => GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, BETTER_RETRY_S, () => (r(), GLib.SOURCE_REMOVE)));
+            // Cancelling (new track or disable()) must remove the timeout, not leave it pending.
             cancellable?.set_error_if_cancelled();
+            await new Promise((resolve, reject) => {
+                let cid = 0;
+                const id = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, BETTER_RETRY_S, () => {
+                    if (cid)
+                        cancellable.disconnect(cid);
+                    resolve();
+                    return GLib.SOURCE_REMOVE;
+                });
+                // g_cancellable_connect; disconnecting from inside this handler would deadlock.
+                cid = cancellable?.connect(() => {
+                    GLib.source_remove(id);
+                    reject(new GLib.Error(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED, 'Operation was cancelled'));
+                }) ?? 0;
+            });
             rec = await better();
         }
 
         const entry = {
+            v: 2,
             syncedLyrics: rec?.syncedLyrics ?? null,
             source: rec?.source ?? null,
             fetchedAt: Date.now(),
